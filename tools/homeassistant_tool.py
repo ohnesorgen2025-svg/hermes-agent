@@ -1,12 +1,13 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers six LLM-callable tools:
+Registers seven LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
 - ``ha_list_services`` -- list available services (actions) per domain
 - ``ha_call_service`` -- call a HA service (turn_on, turn_off, set_temperature, etc.)
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
+- ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
 
 Authentication uses a Long-Lived Access Token via ``HASS_TOKEN`` env var.
 The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.local:8123).
@@ -17,7 +18,13 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Dict, Optional
+
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:  # pragma: no cover - optional dependency
+    mqtt = None
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,21 @@ def _get_headers(token: str = "") -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+
+def _get_mqtt_config() -> tuple[str, int, Optional[str], Optional[str]]:
+    """Return MQTT broker config from env vars."""
+    port_value = os.getenv("MQTT_PORT", "1883")
+    try:
+        port = int(port_value)
+    except ValueError as e:
+        raise ValueError(f"Invalid MQTT_PORT value: {port_value}") from e
+    return (
+        os.getenv("MQTT_HOST", "localhost"),
+        port,
+        os.getenv("MQTT_USER"),
+        os.getenv("MQTT_PASSWORD"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +376,124 @@ async def _async_automation_manage(
     raise ValueError(f"Unsupported action: {action}")
 
 
+def _build_zigbee_request(action: str, args: Dict[str, Any]) -> tuple[str, str, Dict[str, Any], float]:
+    """Validate Zigbee2MQTT args and build topic/payload/timeout."""
+    if action == "permit_join":
+        duration = args.get("duration", 60)
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError) as e:
+            raise ValueError("duration must be an integer") from e
+        if duration < 0 or duration > 254:
+            raise ValueError("duration must be between 0 and 254 seconds")
+        return "permit_join", "permit_join", {"value": True, "time": duration}, duration + 10
+
+    if action == "rename_device":
+        friendly_name = args.get("friendly_name", "")
+        new_name = args.get("new_name", "")
+        if not isinstance(friendly_name, str) or not friendly_name.strip():
+            raise ValueError("Missing required parameter: friendly_name")
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("Missing required parameter: new_name")
+        return "device/rename", "device/rename", {"from": friendly_name.strip(), "to": new_name.strip()}, 30
+
+    if action == "remove_device":
+        ieee_address = args.get("ieee_address", "")
+        if not isinstance(ieee_address, str) or not ieee_address.strip():
+            raise ValueError("remove_device requires explicit ieee_address")
+        return "device/remove", "device/remove", {"id": ieee_address.strip()}, 30
+
+    raise ValueError("Invalid action. Expected one of: permit_join, rename_device, list_devices, remove_device")
+
+
+def _decode_mqtt_payload(payload: bytes) -> Any:
+    """Decode a Zigbee2MQTT payload as JSON when possible."""
+    text = payload.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _make_mqtt_client():
+    """Create a paho MQTT client compatible with paho-mqtt 1.x and 2.x."""
+    if mqtt is None:
+        raise RuntimeError("paho-mqtt is not installed; install hermes-agent[homeassistant]")
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    return mqtt.Client()
+
+
+def _mqtt_request(response_topic: str, request_topic: Optional[str] = None, payload: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Dict[str, Any]:
+    """Subscribe, optionally publish, and wait for one Zigbee2MQTT response."""
+    host, port, username, password = _get_mqtt_config()
+    connected = threading.Event()
+    subscribed = threading.Event()
+    received = threading.Event()
+    response: Dict[str, Any] = {}
+    client = _make_mqtt_client()
+
+    if username:
+        client.username_pw_set(username, password)
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.subscribe(response_topic)
+            connected.set()
+        else:
+            response["error"] = f"MQTT connection failed with code {reason_code}"
+            connected.set()
+
+    def on_subscribe(client, userdata, mid, reason_codes=None, properties=None):
+        subscribed.set()
+
+    def on_message(client, userdata, message):
+        if message.topic == response_topic:
+            response["topic"] = message.topic
+            response["payload"] = _decode_mqtt_payload(message.payload)
+            received.set()
+
+    client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_message = on_message
+
+    try:
+        client.connect_async(host, port, keepalive=30)
+        client.loop_start()
+        if not connected.wait(5):
+            raise TimeoutError(f"Timed out connecting to MQTT broker {host}:{port}")
+        if response.get("error"):
+            raise RuntimeError(response["error"])
+        if not subscribed.wait(5):
+            raise TimeoutError(f"Timed out subscribing to MQTT topic {response_topic}")
+        if request_topic:
+            info = client.publish(request_topic, json.dumps(payload or {}), qos=0)
+            info.wait_for_publish(timeout=5)
+        if not received.wait(timeout):
+            raise TimeoutError(f"Timed out waiting for MQTT response on {response_topic}")
+        return {"success": True, "response": response}
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def _zigbee_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Manage Zigbee2MQTT bridge actions over MQTT."""
+    base_topic = "zigbee2mqtt/bridge"
+    if action == "list_devices":
+        result = _mqtt_request(f"{base_topic}/devices", timeout=30)
+        return {"success": True, "action": action, "devices": result["response"].get("payload")}
+
+    request_path, response_path, payload, timeout = _build_zigbee_request(action, args)
+    result = _mqtt_request(
+        response_topic=f"{base_topic}/response/{response_path}",
+        request_topic=f"{base_topic}/request/{request_path}",
+        payload=payload,
+        timeout=timeout,
+    )
+    return {"success": True, "action": action, "request": payload, "response": result["response"]}
+
+
 async def _async_reload_automations(session, hass_url: str, hass_token: str) -> None:
     """Reload Home Assistant automations after config changes."""
     import aiohttp
@@ -543,6 +683,17 @@ def _handle_automation_manage(args: dict, **kw) -> str:
         return tool_error(f"Failed to manage automation: {e}")
 
 
+def _handle_zigbee_manage(args: dict, **kw) -> str:
+    """Handler for ha_zigbee_manage tool."""
+    action = args.get("action", "")
+    try:
+        result = _zigbee_manage(action, args)
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_zigbee_manage error: %s", e)
+        return tool_error(f"Failed to manage Zigbee2MQTT: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
@@ -550,6 +701,11 @@ def _handle_automation_manage(args: dict, **kw) -> str:
 def _check_ha_available() -> bool:
     """Tool is only available when HASS_TOKEN is set."""
     return bool(os.getenv("HASS_TOKEN"))
+
+
+def _check_mqtt_available() -> bool:
+    """Tool is only available when paho-mqtt can be imported."""
+    return mqtt is not None
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +890,38 @@ HA_AUTOMATION_MANAGE_SCHEMA = {
     },
 }
 
+HA_ZIGBEE_MANAGE_SCHEMA = {
+    "name": "ha_zigbee_manage",
+    "description": "Manage Zigbee2MQTT devices over MQTT: permit joining, list devices, rename devices, or remove devices.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["permit_join", "rename_device", "list_devices", "remove_device"],
+                "description": "Zigbee2MQTT management action to perform.",
+            },
+            "duration": {
+                "type": "integer",
+                "description": "Permit-join duration in seconds. Defaults to 60, maximum 254.",
+            },
+            "friendly_name": {
+                "type": "string",
+                "description": "Current Zigbee2MQTT friendly name for rename_device.",
+            },
+            "new_name": {
+                "type": "string",
+                "description": "New Zigbee2MQTT friendly name for rename_device.",
+            },
+            "ieee_address": {
+                "type": "string",
+                "description": "Explicit IEEE address for remove_device. Wildcards are not allowed.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -792,5 +980,14 @@ registry.register(
     schema=HA_AUTOMATION_MANAGE_SCHEMA,
     handler=_handle_automation_manage,
     check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_zigbee_manage",
+    toolset="homeassistant",
+    schema=HA_ZIGBEE_MANAGE_SCHEMA,
+    handler=_handle_zigbee_manage,
+    check_fn=_check_mqtt_available,
     emoji="🏠",
 )
