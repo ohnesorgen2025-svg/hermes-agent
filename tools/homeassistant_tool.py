@@ -1,10 +1,11 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers four LLM-callable tools:
+Registers five LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
 - ``ha_list_services`` -- list available services (actions) per domain
 - ``ha_call_service`` -- call a HA service (turn_on, turn_off, set_temperature, etc.)
+- ``ha_automation_manage`` -- list, read, create, update, and delete automations
 
 Authentication uses a Long-Lived Access Token via ``HASS_TOKEN`` env var.
 The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.local:8123).
@@ -37,6 +38,10 @@ def _get_config():
 
 # Regex for valid HA entity_id format (e.g. "light.living_room", "sensor.temperature_1")
 _ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
+
+# Regex for HA automation IDs accepted by config endpoints. Allows plain config
+# IDs ("morning_lights") and entity-style IDs ("automation.morning_lights").
+_AUTOMATION_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*(\.[a-z0-9_]+)?$")
 
 # Regex for valid HA service/domain names (e.g. "light", "turn_on", "shell_command").
 # Only lowercase ASCII letters, digits, and underscores — no slashes, dots, or
@@ -174,6 +179,75 @@ def _parse_service_response(
     }
 
 
+def _slugify_automation_id(alias: str) -> str:
+    """Derive a stable automation_id from an automation alias."""
+    slug = re.sub(r"[^a-z0-9_]+", "_", alias.strip().lower())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if not slug or not slug[0].isalpha():
+        slug = f"automation_{slug}" if slug else "automation"
+    return slug
+
+
+def _normalize_automation_id(automation_id: str) -> str:
+    """Validate and normalize an automation config ID."""
+    if not automation_id:
+        raise ValueError("Missing required parameter: automation_id")
+    if not _AUTOMATION_ID_RE.match(automation_id):
+        raise ValueError(f"Invalid automation_id format: {automation_id}")
+    return automation_id.split(".", 1)[1] if automation_id.startswith("automation.") else automation_id
+
+
+def _parse_automation_config(config: Any) -> Dict[str, Any]:
+    """Parse and validate an automation config payload."""
+    if isinstance(config, str):
+        try:
+            config = json.loads(config) if config.strip() else None
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON string in 'config' parameter: {e}") from e
+    if not isinstance(config, dict):
+        raise ValueError("Missing or invalid required parameter: config")
+
+    missing = [field for field in ("alias", "trigger", "action") if field not in config or config[field] in (None, "")]
+    if missing:
+        raise ValueError(f"Automation config missing required field(s): {', '.join(missing)}")
+
+    _validate_safe_automation_actions(config.get("action"))
+    return config
+
+
+def _blocked_service_domain(service_name: str) -> Optional[str]:
+    """Return blocked service domain if service_name references one."""
+    if "." not in service_name:
+        return None
+    domain = service_name.split(".", 1)[0]
+    return domain if domain in _BLOCKED_DOMAINS else None
+
+
+def _validate_safe_automation_actions(node: Any) -> None:
+    """Reject automation actions that call dangerous HA service domains."""
+    if isinstance(node, dict):
+        for service_key in ("service", "action"):
+            service_value = node.get(service_key)
+            if isinstance(service_value, str):
+                blocked_domain = _blocked_service_domain(service_value)
+                if blocked_domain:
+                    raise ValueError(
+                        f"Automation action service '{service_value}' is blocked for security. "
+                        f"Blocked domains: {', '.join(sorted(_BLOCKED_DOMAINS))}."
+                    )
+        domain = node.get("domain")
+        if isinstance(domain, str) and domain in _BLOCKED_DOMAINS:
+            raise ValueError(
+                f"Automation action domain '{domain}' is blocked for security. "
+                f"Blocked domains: {', '.join(sorted(_BLOCKED_DOMAINS))}."
+            )
+        for value in node.values():
+            _validate_safe_automation_actions(value)
+    elif isinstance(node, list):
+        for item in node:
+            _validate_safe_automation_actions(item)
+
+
 async def _async_call_service(
     domain: str,
     service: str,
@@ -198,6 +272,67 @@ async def _async_call_service(
             result = await resp.json()
 
     return _parse_service_response(domain, service, result)
+
+
+async def _async_automation_manage(
+    action: str,
+    automation_id: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Manage Home Assistant automations through config REST endpoints."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    base_url = f"{hass_url}/api/config/automation/config"
+
+    async with aiohttp.ClientSession() as session:
+        if action == "list":
+            async with session.get(base_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+            return {"success": True, "action": action, "automations": result, "count": len(result) if isinstance(result, list) else None}
+
+        normalized_id = _normalize_automation_id(automation_id or "")
+        automation_url = f"{base_url}/{normalized_id}"
+
+        if action == "get":
+            async with session.get(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+            return {"success": True, "action": action, "automation_id": normalized_id, "automation": result}
+
+        if action in {"create", "update"}:
+            async with session.post(
+                automation_url,
+                headers=_get_headers(hass_token),
+                json=config,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+            await _async_reload_automations(session, hass_url, hass_token)
+            return {"success": True, "action": action, "automation_id": normalized_id, "automation": result, "reloaded": True}
+
+        if action == "delete":
+            async with session.delete(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                resp.raise_for_status()
+                try:
+                    result = await resp.json()
+                except aiohttp.ContentTypeError:
+                    result = None
+            await _async_reload_automations(session, hass_url, hass_token)
+            return {"success": True, "action": action, "automation_id": normalized_id, "result": result, "reloaded": True}
+
+    raise ValueError(f"Unsupported action: {action}")
+
+
+async def _async_reload_automations(session, hass_url: str, hass_token: str) -> None:
+    """Reload Home Assistant automations after config changes."""
+    import aiohttp
+
+    url = f"{hass_url}/api/services/automation/reload"
+    async with session.post(url, headers=_get_headers(hass_token), json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +472,27 @@ def _handle_list_services(args: dict, **kw) -> str:
         return tool_error(f"Failed to list services: {e}")
 
 
+def _handle_automation_manage(args: dict, **kw) -> str:
+    """Handler for ha_automation_manage tool."""
+    action = args.get("action", "")
+    if action not in {"list", "get", "create", "update", "delete"}:
+        return tool_error("Invalid action. Expected one of: list, get, create, update, delete")
+
+    automation_id = args.get("automation_id")
+    config = args.get("config")
+    try:
+        parsed_config = None
+        if action in {"create", "update"}:
+            parsed_config = _parse_automation_config(config)
+            if not automation_id and action == "create":
+                automation_id = _slugify_automation_id(str(parsed_config["alias"]))
+        result = _run_async(_async_automation_manage(action, automation_id, parsed_config))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_automation_manage error: %s", e)
+        return tool_error(f"Failed to manage automation: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
@@ -469,6 +625,42 @@ HA_CALL_SERVICE_SCHEMA = {
     },
 }
 
+HA_AUTOMATION_MANAGE_SCHEMA = {
+    "name": "ha_automation_manage",
+    "description": (
+        "Manage Home Assistant automations. List, get, create, update, or delete "
+        "automation configs via the Home Assistant config API. Create and update "
+        "reload automations automatically. For safety, shell_command, command_line, "
+        "and python_script services are blocked in automation actions."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get", "create", "update", "delete"],
+                "description": "Automation management action to perform.",
+            },
+            "automation_id": {
+                "type": "string",
+                "description": (
+                    "Automation config ID, e.g. 'morning_lights' or "
+                    "'automation.morning_lights'. Required for get, update, and delete. "
+                    "For create, omitted IDs are derived from config.alias."
+                ),
+            },
+            "config": {
+                "type": "object",
+                "description": (
+                    "Automation config for create/update. Required fields: alias, trigger, action. "
+                    "Optional fields include condition and mode."
+                ),
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -508,6 +700,15 @@ registry.register(
     toolset="homeassistant",
     schema=HA_CALL_SERVICE_SCHEMA,
     handler=_handle_call_service,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_automation_manage",
+    toolset="homeassistant",
+    schema=HA_AUTOMATION_MANAGE_SCHEMA,
+    handler=_handle_automation_manage,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
