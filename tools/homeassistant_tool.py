@@ -1,11 +1,12 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers five LLM-callable tools:
+Registers six LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
 - ``ha_list_services`` -- list available services (actions) per domain
 - ``ha_call_service`` -- call a HA service (turn_on, turn_off, set_temperature, etc.)
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
+- ``ha_entity_rename`` -- rename an entity and optionally set its icon
 
 Authentication uses a Long-Lived Access Token via ``HASS_TOKEN`` env var.
 The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.local:8123).
@@ -142,6 +143,33 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
         "last_changed": data.get("last_changed"),
         "last_updated": data.get("last_updated"),
     }
+
+
+async def _async_entity_rename(
+    entity_id: str,
+    name: str,
+    icon: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Rename a Home Assistant entity via the entity registry config API."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    url = f"{hass_url}/api/config/entity_registry/{entity_id}"
+    payload = {"name": name}
+    if icon:
+        payload["icon"] = icon
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            headers=_get_headers(hass_token),
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+
+    return {"success": True, "entity_id": entity_id, "entity": result}
 
 
 def _build_service_payload(
@@ -383,6 +411,28 @@ def _handle_get_state(args: dict, **kw) -> str:
         return tool_error(f"Failed to get state for {entity_id}: {e}")
 
 
+def _handle_entity_rename(args: dict, **kw) -> str:
+    """Handler for ha_entity_rename tool."""
+    entity_id = args.get("entity_id", "")
+    name = args.get("name", "")
+    icon = args.get("icon")
+    if not entity_id:
+        return tool_error("Missing required parameter: entity_id")
+    if not _ENTITY_ID_RE.match(entity_id):
+        return tool_error(f"Invalid entity_id format: {entity_id}")
+    if not isinstance(name, str) or not name.strip():
+        return tool_error("Missing required parameter: name")
+    if icon is not None and (not isinstance(icon, str) or not icon.strip()):
+        return tool_error("Invalid icon parameter")
+
+    try:
+        result = _run_async(_async_entity_rename(entity_id, name.strip(), icon.strip() if icon else None))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_entity_rename error: %s", e)
+        return tool_error(f"Failed to rename entity {entity_id}: {e}")
+
+
 def _handle_call_service(args: dict, **kw) -> str:
     """Handler for ha_call_service tool."""
     domain = args.get("domain", "")
@@ -557,6 +607,29 @@ HA_GET_STATE_SCHEMA = {
     },
 }
 
+HA_ENTITY_RENAME_SCHEMA = {
+    "name": "ha_entity_rename",
+    "description": "Rename a Home Assistant entity and optionally set its icon via the entity registry API.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity_id": {
+                "type": "string",
+                "description": "Entity ID to rename, e.g. 'light.living_room'.",
+            },
+            "name": {
+                "type": "string",
+                "description": "New friendly name for the entity.",
+            },
+            "icon": {
+                "type": "string",
+                "description": "Optional Material Design icon, e.g. 'mdi:lamp'.",
+            },
+        },
+        "required": ["entity_id", "name"],
+    },
+}
+
 HA_LIST_SERVICES_SCHEMA = {
     "name": "ha_list_services",
     "description": (
@@ -682,6 +755,15 @@ registry.register(
     toolset="homeassistant",
     schema=HA_GET_STATE_SCHEMA,
     handler=_handle_get_state,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_entity_rename",
+    toolset="homeassistant",
+    schema=HA_ENTITY_RENAME_SCHEMA,
+    handler=_handle_entity_rename,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
