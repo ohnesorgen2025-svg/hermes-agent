@@ -1,6 +1,6 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers seven LLM-callable tools:
+Registers eight LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
 - ``ha_list_services`` -- list available services (actions) per domain
@@ -8,6 +8,7 @@ Registers seven LLM-callable tools:
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
 - ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
+- ``ha_matter_manage`` -- expose/unexpose entities to Matter Hub via labels
 
 Authentication uses a Long-Lived Access Token via ``HASS_TOKEN`` env var.
 The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.local:8123).
@@ -192,6 +193,81 @@ async def _async_entity_rename(
             result = await resp.json()
 
     return {"success": True, "entity_id": entity_id, "entity": result}
+
+
+async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
+    """Manage the 'matter' entity label used by Home Assistant Matter Hub."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+
+    async with aiohttp.ClientSession() as session:
+        if action == "list_exposed":
+            url = f"{hass_url}/api/template"
+            payload = {"template": "{{ label_entities('matter') | join(',') }}"}
+            async with session.post(
+                url,
+                headers=_get_headers(hass_token),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                resp.raise_for_status()
+                rendered = (await resp.text()).strip()
+            entities = [item.strip() for item in rendered.split(",") if item.strip()]
+            message = "Keine Entities freigegeben." if not entities else f"{len(entities)} Entities fuer Alexa freigegeben."
+            return {"success": True, "action": action, "count": len(entities), "entities": entities, "message": message}
+
+        url = f"{hass_url}/api/config/entity_registry/{entity_id}"
+        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            resp.raise_for_status()
+            entity = await resp.json()
+
+        labels = entity.get("labels") or []
+        if not isinstance(labels, list):
+            labels = []
+
+        if action == "expose":
+            if "matter" in labels:
+                return {
+                    "success": True,
+                    "action": action,
+                    "entity_id": entity_id,
+                    "labels": labels,
+                    "message": f"{entity_id} ist bereits fuer Alexa freigegeben.",
+                }
+            updated_labels = [*labels, "matter"]
+            message = f"{entity_id} wurde fuer Alexa freigegeben."
+        elif action == "unexpose":
+            if "matter" not in labels:
+                return {
+                    "success": True,
+                    "action": action,
+                    "entity_id": entity_id,
+                    "labels": labels,
+                    "message": f"{entity_id} ist nicht fuer Alexa freigegeben.",
+                }
+            updated_labels = [label for label in labels if label != "matter"]
+            message = f"{entity_id} ist nicht mehr fuer Alexa freigegeben."
+        else:
+            raise ValueError(f"Unsupported action: {action}")
+
+        async with session.post(
+            url,
+            headers=_get_headers(hass_token),
+            json={"labels": updated_labels},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+
+    return {
+        "success": True,
+        "action": action,
+        "entity_id": entity_id,
+        "labels": updated_labels,
+        "entity": result,
+        "message": message,
+    }
 
 
 def _build_service_payload(
@@ -683,6 +759,27 @@ def _handle_automation_manage(args: dict, **kw) -> str:
         return tool_error(f"Failed to manage automation: {e}")
 
 
+def _handle_matter_manage(args: dict, **kw) -> str:
+    """Handler for ha_matter_manage tool."""
+    action = args.get("action", "")
+    if action not in {"expose", "unexpose", "list_exposed"}:
+        return tool_error("Invalid action. Expected one of: expose, unexpose, list_exposed")
+
+    entity_id = args.get("entity_id", "")
+    if action in {"expose", "unexpose"}:
+        if not entity_id:
+            return tool_error("Missing required parameter: entity_id")
+        if not _ENTITY_ID_RE.match(entity_id):
+            return tool_error(f"Invalid entity_id format: {entity_id}")
+
+    try:
+        result = _run_async(_async_matter_manage(action, entity_id or None))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_matter_manage error: %s", e)
+        return tool_error(f"Failed to manage Matter exposure: {e}")
+
+
 def _handle_zigbee_manage(args: dict, **kw) -> str:
     """Handler for ha_zigbee_manage tool."""
     action = args.get("action", "")
@@ -922,6 +1019,32 @@ HA_ZIGBEE_MANAGE_SCHEMA = {
     },
 }
 
+SCHEMA_MATTER_MANAGE = {
+    "name": "ha_matter_manage",
+    "description": (
+        "Manage which Home Assistant entities are exposed to Alexa via Matter Hub. "
+        "Adds or removes the entity label 'matter' which Matter Hub uses to filter exposed devices."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["expose", "unexpose", "list_exposed"],
+                "description": (
+                    "expose adds the matter label, unexpose removes it, "
+                    "list_exposed shows all labeled entities"
+                ),
+            },
+            "entity_id": {
+                "type": "string",
+                "description": "Home Assistant entity ID (required for expose and unexpose)",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -990,4 +1113,13 @@ registry.register(
     handler=_handle_zigbee_manage,
     check_fn=_check_mqtt_available,
     emoji="🏠",
+)
+
+registry.register(
+    name="ha_matter_manage",
+    toolset="homeassistant",
+    schema=SCHEMA_MATTER_MANAGE,
+    handler=_handle_matter_manage,
+    check_fn=_check_ha_available,
+    emoji="📡",
 )
