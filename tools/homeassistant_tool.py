@@ -217,10 +217,19 @@ async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> 
             message = "Keine Entities freigegeben." if not entities else f"{len(entities)} Entities fuer Alexa freigegeben."
             return {"success": True, "action": action, "count": len(entities), "entities": entities, "message": message}
 
-        url = f"{hass_url}/api/config/entity_registry/{entity_id}"
-        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        list_url = f"{hass_url}/api/config/entity_registry/list"
+        async with session.post(
+            list_url,
+            headers=_get_headers(hass_token),
+            json={},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
             resp.raise_for_status()
-            entity = await resp.json()
+            entities = await resp.json()
+
+        entity = next((item for item in entities if item.get("entity_id") == entity_id), None)
+        if entity is None:
+            raise ValueError(f"Entity not found in Home Assistant entity registry: {entity_id}")
 
         labels = entity.get("labels") or []
         if not isinstance(labels, list):
@@ -252,9 +261,9 @@ async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> 
             raise ValueError(f"Unsupported action: {action}")
 
         async with session.post(
-            url,
+            f"{hass_url}/api/config/entity_registry/update",
             headers=_get_headers(hass_token),
-            json={"labels": updated_labels},
+            json={"entity_id": entity_id, "labels": updated_labels},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             resp.raise_for_status()
@@ -775,6 +784,9 @@ def _handle_matter_manage(args: dict, **kw) -> str:
     try:
         result = _run_async(_async_matter_manage(action, entity_id or None))
         return json.dumps({"result": result})
+    except ValueError as e:
+        logger.error("ha_matter_manage validation error: %s", e)
+        return tool_error(str(e))
     except Exception as e:
         logger.error("ha_matter_manage error: %s", e)
         return tool_error(f"Failed to manage Matter exposure: {e}")
