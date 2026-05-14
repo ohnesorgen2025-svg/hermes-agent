@@ -195,6 +195,57 @@ async def _async_entity_rename(
     return {"success": True, "entity_id": entity_id, "entity": result}
 
 
+async def _ws_get_entity(entity_id) -> dict:
+    """Get an entity registry entry via the Home Assistant WebSocket API."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    ws_url = hass_url.replace("http://", "ws://").replace("https://", "wss://") + "/websocket"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            await ws.receive_json()
+            await ws.send_json({"type": "auth", "access_token": hass_token})
+            msg = await ws.receive_json()
+            if msg.get("type") != "auth_ok":
+                raise Exception("WebSocket auth failed")
+
+            await ws.send_json({"id": 1, "type": "config/entity_registry/get", "entity_id": entity_id})
+            msg = await ws.receive_json()
+            if not msg.get("success"):
+                raise Exception(msg.get("error", {}).get("message", "Unknown error"))
+            return msg.get("result", {})
+
+
+async def _ws_update_entity_labels(entity_id, labels) -> dict:
+    """Update an entity registry entry's labels via the Home Assistant WebSocket API."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    ws_url = hass_url.replace("http://", "ws://").replace("https://", "wss://") + "/websocket"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            await ws.receive_json()
+            await ws.send_json({"type": "auth", "access_token": hass_token})
+            msg = await ws.receive_json()
+            if msg.get("type") != "auth_ok":
+                raise Exception("WebSocket auth failed")
+
+            await ws.send_json(
+                {
+                    "id": 1,
+                    "type": "config/entity_registry/update",
+                    "entity_id": entity_id,
+                    "labels": labels,
+                }
+            )
+            msg = await ws.receive_json()
+            if not msg.get("success"):
+                raise Exception(msg.get("error", {}).get("message", "Unknown error"))
+            return msg.get("result", {})
+
+
 async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
     """Manage the 'matter' entity label used by Home Assistant Matter Hub."""
     import aiohttp
@@ -217,57 +268,37 @@ async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> 
             message = "Keine Entities freigegeben." if not entities else f"{len(entities)} Entities fuer Alexa freigegeben."
             return {"success": True, "action": action, "count": len(entities), "entities": entities, "message": message}
 
-        list_url = f"{hass_url}/api/config/entity_registry/list"
-        async with session.post(
-            list_url,
-            headers=_get_headers(hass_token),
-            json={},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            resp.raise_for_status()
-            entities = await resp.json()
-
-        entity = next((item for item in entities if item.get("entity_id") == entity_id), None)
-        if entity is None:
-            raise ValueError(f"Entity not found in Home Assistant entity registry: {entity_id}")
-
-        labels = entity.get("labels") or []
-        if not isinstance(labels, list):
-            labels = []
+        entry = await _ws_get_entity(entity_id)
+        current = entry.get("labels", [])
+        if not isinstance(current, list):
+            current = []
 
         if action == "expose":
-            if "matter" in labels:
+            if "matter" in current:
                 return {
                     "success": True,
                     "action": action,
                     "entity_id": entity_id,
-                    "labels": labels,
+                    "labels": current,
                     "message": f"{entity_id} ist bereits fuer Alexa freigegeben.",
                 }
-            updated_labels = [*labels, "matter"]
+            updated_labels = [*current, "matter"]
             message = f"{entity_id} wurde fuer Alexa freigegeben."
         elif action == "unexpose":
-            if "matter" not in labels:
+            if "matter" not in current:
                 return {
                     "success": True,
                     "action": action,
                     "entity_id": entity_id,
-                    "labels": labels,
+                    "labels": current,
                     "message": f"{entity_id} ist nicht fuer Alexa freigegeben.",
                 }
-            updated_labels = [label for label in labels if label != "matter"]
+            updated_labels = [label for label in current if label != "matter"]
             message = f"{entity_id} ist nicht mehr fuer Alexa freigegeben."
         else:
             raise ValueError(f"Unsupported action: {action}")
 
-        async with session.post(
-            f"{hass_url}/api/config/entity_registry/update",
-            headers=_get_headers(hass_token),
-            json={"entity_id": entity_id, "labels": updated_labels},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
+        result = await _ws_update_entity_labels(entity_id, updated_labels)
 
     return {
         "success": True,
@@ -789,7 +820,7 @@ def _handle_matter_manage(args: dict, **kw) -> str:
         return tool_error(str(e))
     except Exception as e:
         logger.error("ha_matter_manage error: %s", e)
-        return tool_error(f"Failed to manage Matter exposure: {e}")
+        return tool_error(str(e) or "Failed to manage Matter exposure")
 
 
 def _handle_zigbee_manage(args: dict, **kw) -> str:
