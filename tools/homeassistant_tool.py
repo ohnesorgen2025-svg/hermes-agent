@@ -1,8 +1,11 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers eight LLM-callable tools:
+Registers eleven LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
+- ``ha_list_areas`` -- list Home Assistant areas via the area registry
+- ``ha_create_area`` -- create a Home Assistant area via the area registry
+- ``ha_assign_area`` -- assign an entity to an existing Home Assistant area
 - ``ha_list_services`` -- list available services (actions) per domain
 - ``ha_call_service`` -- call a HA service (turn_on, turn_off, set_temperature, etc.)
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
@@ -195,55 +198,102 @@ async def _async_entity_rename(
     return {"success": True, "entity_id": entity_id, "entity": result}
 
 
-async def _ws_get_entity(entity_id) -> dict:
-    """Get an entity registry entry via the Home Assistant WebSocket API."""
+def _get_ws_url() -> str:
+    """Return the Home Assistant WebSocket endpoint for the current HASS_URL."""
+    hass_url, _ = _get_config()
+    base_url = hass_url.rstrip("/")
+    if base_url.endswith("/api"):
+        ws_url = f"{base_url}/websocket"
+    else:
+        ws_url = f"{base_url}/api/websocket"
+    return ws_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+
+
+async def _ws_command(message: Dict[str, Any]) -> Any:
+    """Send a Home Assistant WebSocket command and return the result payload."""
     import aiohttp
 
-    hass_url, hass_token = _get_config()
-    ws_url = hass_url.replace("http://", "ws://").replace("https://", "wss://") + "/websocket"
+    _, hass_token = _get_config()
+    payload = dict(message)
+    payload.setdefault("id", 1)
 
     async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(ws_url) as ws:
+        async with session.ws_connect(_get_ws_url()) as ws:
             await ws.receive_json()
             await ws.send_json({"type": "auth", "access_token": hass_token})
             msg = await ws.receive_json()
             if msg.get("type") != "auth_ok":
                 raise Exception("WebSocket auth failed")
 
-            await ws.send_json({"id": 1, "type": "config/entity_registry/get", "entity_id": entity_id})
+            await ws.send_json(payload)
             msg = await ws.receive_json()
             if not msg.get("success"):
                 raise Exception(msg.get("error", {}).get("message", "Unknown error"))
-            return msg.get("result", {})
+            return msg.get("result")
+
+
+async def _ws_get_entity(entity_id) -> dict:
+    """Get an entity registry entry via the Home Assistant WebSocket API."""
+    result = await _ws_command({"type": "config/entity_registry/get", "entity_id": entity_id})
+    return result or {}
 
 
 async def _ws_update_entity_labels(entity_id, labels) -> dict:
     """Update an entity registry entry's labels via the Home Assistant WebSocket API."""
-    import aiohttp
+    result = await _ws_command(
+        {
+            "type": "config/entity_registry/update",
+            "entity_id": entity_id,
+            "labels": labels,
+        }
+    )
+    return result or {}
 
-    hass_url, hass_token = _get_config()
-    ws_url = hass_url.replace("http://", "ws://").replace("https://", "wss://") + "/websocket"
 
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(ws_url) as ws:
-            await ws.receive_json()
-            await ws.send_json({"type": "auth", "access_token": hass_token})
-            msg = await ws.receive_json()
-            if msg.get("type") != "auth_ok":
-                raise Exception("WebSocket auth failed")
+async def _async_list_areas() -> Dict[str, Any]:
+    """List Home Assistant areas via the area registry WebSocket API."""
+    areas = await _ws_command({"type": "config/area_registry/list"})
+    normalized = []
+    for area in areas or []:
+        normalized.append(
+            {
+                "area_id": area.get("area_id", ""),
+                "name": area.get("name", ""),
+                "aliases": area.get("aliases", []),
+                "floor_id": area.get("floor_id"),
+            }
+        )
+    normalized.sort(key=lambda item: (item["name"] or "").lower())
+    return {"count": len(normalized), "areas": normalized}
 
-            await ws.send_json(
-                {
-                    "id": 1,
-                    "type": "config/entity_registry/update",
-                    "entity_id": entity_id,
-                    "labels": labels,
-                }
-            )
-            msg = await ws.receive_json()
-            if not msg.get("success"):
-                raise Exception(msg.get("error", {}).get("message", "Unknown error"))
-            return msg.get("result", {})
+
+async def _async_create_area(name: str) -> Dict[str, Any]:
+    """Create a Home Assistant area via the area registry WebSocket API."""
+    result = await _ws_command({"type": "config/area_registry/create", "name": name})
+    return {
+        "success": True,
+        "area_id": result.get("area_id", ""),
+        "name": result.get("name", name),
+        "area": result,
+    }
+
+
+async def _async_assign_area(entity_id: str, area_id: str) -> Dict[str, Any]:
+    """Assign an entity to a Home Assistant area via the entity registry WebSocket API."""
+    result = await _ws_command(
+        {
+            "type": "config/entity_registry/update",
+            "entity_id": entity_id,
+            "area_id": area_id,
+        }
+    )
+    return {
+        "success": True,
+        "entity_id": entity_id,
+        "area_id": area_id,
+        "entity": result,
+        "message": f"{entity_id} wurde dem Bereich {area_id} zugeordnet.",
+    }
 
 
 async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> Dict[str, Any]:
@@ -667,6 +717,49 @@ def _handle_get_state(args: dict, **kw) -> str:
         return tool_error(f"Failed to get state for {entity_id}: {e}")
 
 
+def _handle_list_areas(args: dict, **kw) -> str:
+    """Handler for ha_list_areas tool."""
+    try:
+        result = _run_async(_async_list_areas())
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_list_areas error: %s", e)
+        return tool_error(f"Failed to list areas: {e}")
+
+
+def _handle_create_area(args: dict, **kw) -> str:
+    """Handler for ha_create_area tool."""
+    name = args.get("name", "")
+    if not isinstance(name, str) or not name.strip():
+        return tool_error("Missing required parameter: name")
+
+    try:
+        result = _run_async(_async_create_area(name.strip()))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_create_area error: %s", e)
+        return tool_error(f"Failed to create area: {e}")
+
+
+def _handle_assign_area(args: dict, **kw) -> str:
+    """Handler for ha_assign_area tool."""
+    entity_id = args.get("entity_id", "")
+    area_id = args.get("area_id", "")
+    if not entity_id:
+        return tool_error("Missing required parameter: entity_id")
+    if not _ENTITY_ID_RE.match(entity_id):
+        return tool_error(f"Invalid entity_id format: {entity_id}")
+    if not isinstance(area_id, str) or not area_id.strip():
+        return tool_error("Missing required parameter: area_id")
+
+    try:
+        result = _run_async(_async_assign_area(entity_id, area_id.strip()))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_assign_area error: %s", e)
+        return tool_error(f"Failed to assign area for {entity_id}: {e}")
+
+
 def _handle_entity_rename(args: dict, **kw) -> str:
     """Handler for ha_entity_rename tool."""
     entity_id = args.get("entity_id", "")
@@ -903,6 +996,50 @@ HA_GET_STATE_SCHEMA = {
     },
 }
 
+HA_LIST_AREAS_SCHEMA = {
+    "name": "ha_list_areas",
+    "description": "List Home Assistant areas via the area registry WebSocket API.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+HA_CREATE_AREA_SCHEMA = {
+    "name": "ha_create_area",
+    "description": "Create a new Home Assistant area via the area registry WebSocket API.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Display name for the new area, e.g. 'Büro' or 'Wohnzimmer'.",
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+HA_ASSIGN_AREA_SCHEMA = {
+    "name": "ha_assign_area",
+    "description": "Assign an existing Home Assistant entity to an area via the entity registry WebSocket API.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity_id": {
+                "type": "string",
+                "description": "Entity ID to assign, e.g. 'sensor.klima_buero_temperature'.",
+            },
+            "area_id": {
+                "type": "string",
+                "description": "Existing Home Assistant area_id, e.g. 'buero' or 'wohnzimmer'.",
+            },
+        },
+        "required": ["entity_id", "area_id"],
+    },
+}
+
 HA_ENTITY_RENAME_SCHEMA = {
     "name": "ha_entity_rename",
     "description": "Rename a Home Assistant entity and optionally set its icon via the entity registry API.",
@@ -1109,6 +1246,33 @@ registry.register(
     toolset="homeassistant",
     schema=HA_GET_STATE_SCHEMA,
     handler=_handle_get_state,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_list_areas",
+    toolset="homeassistant",
+    schema=HA_LIST_AREAS_SCHEMA,
+    handler=_handle_list_areas,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_create_area",
+    toolset="homeassistant",
+    schema=HA_CREATE_AREA_SCHEMA,
+    handler=_handle_create_area,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_assign_area",
+    toolset="homeassistant",
+    schema=HA_ASSIGN_AREA_SCHEMA,
+    handler=_handle_assign_area,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
