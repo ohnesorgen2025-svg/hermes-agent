@@ -230,6 +230,22 @@ async def _async_detect_capabilities() -> Dict[str, Any]:
     }
 
 
+def _is_controller_like_change(entity_id: str, domain: str, new_state: str, attributes: Dict[str, Any]) -> bool:
+    """Return true for entities that look like physical controls or action sensors."""
+    _, _, object_id = entity_id.partition(".")
+    lowered = f"{entity_id} {attributes.get('friendly_name', '')} {new_state}".lower()
+    controller_terms = (
+        "action", "click", "button", "remote", "dimmer", "schalter", "taster",
+        "single", "double", "triple", "hold", "release", "rotate", "brightness_move",
+        "brightness_stop", "arrow_left", "arrow_right",
+    )
+    if domain in {"button", "input_button", "event"}:
+        return True
+    if object_id.endswith(("_action", "_click", "_button", "_scene")):
+        return True
+    return any(term in lowered for term in controller_terms)
+
+
 def _score_state_change(entity_id: str, old_state: str, new_state: str, attributes: Dict[str, Any]) -> tuple[int, list[str]]:
     """Score how likely a state change was caused by an intentional device action."""
     domain, _, object_id = entity_id.partition(".")
@@ -247,12 +263,20 @@ def _score_state_change(entity_id: str, old_state: str, new_state: str, attribut
         score -= 25
         reasons.append("diagnostic_or_periodic_sensor")
 
+    controller_like = _is_controller_like_change(entity_id, domain, new_state, attributes)
+
     if domain in {"button", "input_button", "event"}:
-        score += 55
+        score += 65
         reasons.append("button_or_event")
-    elif domain in {"binary_sensor", "switch", "light", "cover", "lock", "fan"}:
+    elif controller_like:
+        score += 60
+        reasons.append("controller_action_entity")
+    elif domain in {"binary_sensor", "cover", "lock"}:
         score += 35
         reasons.append("interactive_domain")
+    elif domain in {"switch", "light", "fan"}:
+        score += 20
+        reasons.append("possibly_downstream_actuator")
     elif domain == "sensor":
         score += 5
         reasons.append("sensor_change")
@@ -278,6 +302,40 @@ def _score_state_change(entity_id: str, old_state: str, new_state: str, attribut
         reasons.append("unavailable_state")
 
     return max(score, 0), reasons
+
+
+def _apply_cascade_context(events: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Demote likely downstream actuator events when a controller caused a cascade."""
+    downstream_domains = {"light", "switch", "fan", "cover"}
+    downstream_events = [event for event in events if event.get("domain") in downstream_domains]
+    controller_events = [
+        event for event in events
+        if _is_controller_like_change(
+            str(event.get("entity_id") or ""),
+            str(event.get("domain") or ""),
+            str(event.get("new_state") or ""),
+            {"friendly_name": event.get("friendly_name", "")},
+        )
+    ]
+
+    cascade_detected = len(downstream_events) >= 3 and bool(controller_events)
+    if cascade_detected:
+        for event in downstream_events:
+            event["score"] = max(int(event.get("score", 0)) - 35, 0)
+            reasons = event.setdefault("reasons", [])
+            if "likely_downstream_cascade" not in reasons:
+                reasons.append("likely_downstream_cascade")
+        for event in controller_events:
+            event["score"] = int(event.get("score", 0)) + 25
+            reasons = event.setdefault("reasons", [])
+            if "likely_controller_for_cascade" not in reasons:
+                reasons.append("likely_controller_for_cascade")
+
+    return {
+        "cascade_detected": cascade_detected,
+        "downstream_event_count": len(downstream_events),
+        "controller_event_count": len(controller_events),
+    }
 
 
 async def _async_observe_changes(
@@ -357,6 +415,7 @@ async def _async_observe_changes(
                     }
                 )
 
+    cascade = _apply_cascade_context(events)
     events.sort(key=lambda item: item.get("score", 0), reverse=True)
     strong = [item for item in events if item.get("score", 0) >= 60]
     return {
@@ -364,6 +423,7 @@ async def _async_observe_changes(
         "duration_seconds": duration_seconds,
         "event_count": len(events),
         "strong_count": len(strong),
+        "cascade": cascade,
         "candidates": events[:10],
         "best_candidate": events[0] if events else None,
         "message": "Keine passenden Aenderungen erkannt." if not events else f"{len(events)} Aenderungen erkannt, {len(strong)} starke Kandidaten.",
