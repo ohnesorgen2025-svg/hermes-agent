@@ -1,8 +1,10 @@
 """Home Assistant tool for controlling smart home devices via REST API.
 
-Registers eleven LLM-callable tools:
+Registers LLM-callable tools:
 - ``ha_list_entities`` -- list/filter entities by domain or area
 - ``ha_get_state`` -- get detailed state of a single entity
+- ``ha_detect_capabilities`` -- detect configured HA integrations for onboarding
+- ``ha_observe_changes`` -- briefly listen for Home Assistant state changes
 - ``ha_list_areas`` -- list Home Assistant areas via the area registry
 - ``ha_create_area`` -- create a Home Assistant area via the area registry
 - ``ha_assign_area`` -- assign an entity to an existing Home Assistant area
@@ -168,6 +170,203 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
         "attributes": data.get("attributes", {}),
         "last_changed": data.get("last_changed"),
         "last_updated": data.get("last_updated"),
+    }
+
+
+async def _async_detect_capabilities() -> Dict[str, Any]:
+    """Detect relevant Home Assistant integration capabilities for onboarding."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    url = f"{hass_url}/api/config/config_entries/entry"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            resp.raise_for_status()
+            entries = await resp.json()
+
+    domains: set[str] = set()
+    homematic_entries = []
+    mqtt_entries = []
+    matter_entries = []
+
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        domain = str(entry.get("domain") or "").strip().lower()
+        state = str(entry.get("state") or "").strip().lower()
+        title = str(entry.get("title") or "").strip()
+        if not domain:
+            continue
+        domains.add(domain)
+
+        info = {
+            "domain": domain,
+            "title": title,
+            "state": state,
+        }
+
+        if domain == "mqtt":
+            mqtt_entries.append(info)
+        if domain == "matter":
+            matter_entries.append(info)
+        if domain.startswith("homematic"):
+            homematic_entries.append(info)
+
+    def _is_configured(integration_entries: list[dict[str, str]]) -> bool:
+        return any(item.get("state") not in {"failed_setup", "setup_error", "not_loaded"} for item in integration_entries)
+
+    return {
+        "success": True,
+        "integrations": sorted(domains),
+        "mqtt_configured": _is_configured(mqtt_entries),
+        "matter_configured": _is_configured(matter_entries),
+        "homematic_configured": _is_configured(homematic_entries),
+        "details": {
+            "mqtt": mqtt_entries,
+            "matter": matter_entries,
+            "homematic": homematic_entries,
+        },
+    }
+
+
+def _score_state_change(entity_id: str, old_state: str, new_state: str, attributes: Dict[str, Any]) -> tuple[int, list[str]]:
+    """Score how likely a state change was caused by an intentional device action."""
+    domain, _, object_id = entity_id.partition(".")
+    lowered = f"{entity_id} {attributes.get('friendly_name', '')}".lower()
+    reasons: list[str] = []
+    score = 10
+
+    noisy_terms = (
+        "battery", "batterie", "linkquality", "rssi", "signal", "lqi", "uptime",
+        "last_seen", "last seen", "update", "diagnostic", "diagnose", "illuminance",
+        "temperature", "temperatur", "humidity", "feuchtigkeit", "power", "energy",
+        "voltage", "current", "leistung", "energie",
+    )
+    if any(term in lowered for term in noisy_terms):
+        score -= 25
+        reasons.append("diagnostic_or_periodic_sensor")
+
+    if domain in {"button", "input_button", "event"}:
+        score += 55
+        reasons.append("button_or_event")
+    elif domain in {"binary_sensor", "switch", "light", "cover", "lock", "fan"}:
+        score += 35
+        reasons.append("interactive_domain")
+    elif domain == "sensor":
+        score += 5
+        reasons.append("sensor_change")
+
+    transition = f"{old_state}->{new_state}"
+    strong_transitions = {
+        "off->on", "on->off", "closed->open", "open->closed", "locked->unlocked",
+        "unlocked->locked", "idle->press", "idle->pressed", "standby->press",
+    }
+    if transition in strong_transitions:
+        score += 45
+        reasons.append("strong_state_transition")
+    elif old_state != new_state:
+        score += 15
+        reasons.append("state_changed")
+
+    if object_id.endswith(("_action", "_click", "_button", "_contact", "_occupancy", "_motion")):
+        score += 25
+        reasons.append("interactive_entity_name")
+
+    if new_state in {"unknown", "unavailable"}:
+        score -= 45
+        reasons.append("unavailable_state")
+
+    return max(score, 0), reasons
+
+
+async def _async_observe_changes(
+    duration_seconds: int = 10,
+    include_domains: Optional[list[str]] = None,
+    ignore_domains: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    """Listen to Home Assistant state_changed events for a short window."""
+    import aiohttp
+
+    _, hass_token = _get_config()
+    duration_seconds = max(3, min(int(duration_seconds or 10), 20))
+    include = {item.strip().lower() for item in include_domains or [] if isinstance(item, str) and item.strip()}
+    ignored = {item.strip().lower() for item in ignore_domains or [] if isinstance(item, str) and item.strip()}
+    ignored.update({"sun", "weather", "zone", "person", "device_tracker", "update", "calendar"})
+
+    events: list[Dict[str, Any]] = []
+    command_id = 1
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(_get_ws_url(), heartbeat=20) as ws:
+            await ws.receive_json()
+            await ws.send_json({"type": "auth", "access_token": hass_token})
+            msg = await ws.receive_json()
+            if msg.get("type") != "auth_ok":
+                raise Exception("WebSocket auth failed")
+
+            command_id += 1
+            await ws.send_json({"id": command_id, "type": "subscribe_events", "event_type": "state_changed"})
+            msg = await ws.receive_json()
+            if not msg.get("success"):
+                raise Exception(msg.get("error", {}).get("message", "Failed to subscribe to state_changed events"))
+
+            loop = asyncio.get_running_loop()
+            end_at = loop.time() + duration_seconds
+            while True:
+                remaining = end_at - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    msg = await asyncio.wait_for(ws.receive_json(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
+                if msg.get("type") != "event":
+                    continue
+                event = msg.get("event", {})
+                data = event.get("data", {}) if isinstance(event, dict) else {}
+                entity_id = str(data.get("entity_id") or "")
+                if not entity_id or "." not in entity_id:
+                    continue
+                domain = entity_id.split(".", 1)[0]
+                if include and domain not in include:
+                    continue
+                if domain in ignored:
+                    continue
+
+                old = data.get("old_state") or {}
+                new = data.get("new_state") or {}
+                if not isinstance(old, dict) or not isinstance(new, dict):
+                    continue
+                old_state = str(old.get("state") or "")
+                new_state = str(new.get("state") or "")
+                attributes = new.get("attributes") if isinstance(new.get("attributes"), dict) else {}
+                score, reasons = _score_state_change(entity_id, old_state, new_state, attributes)
+                events.append(
+                    {
+                        "entity_id": entity_id,
+                        "domain": domain,
+                        "friendly_name": attributes.get("friendly_name", ""),
+                        "old_state": old_state,
+                        "new_state": new_state,
+                        "last_changed": new.get("last_changed"),
+                        "last_updated": new.get("last_updated"),
+                        "score": score,
+                        "reasons": reasons,
+                    }
+                )
+
+    events.sort(key=lambda item: item.get("score", 0), reverse=True)
+    strong = [item for item in events if item.get("score", 0) >= 60]
+    return {
+        "success": True,
+        "duration_seconds": duration_seconds,
+        "event_count": len(events),
+        "strong_count": len(strong),
+        "candidates": events[:10],
+        "best_candidate": events[0] if events else None,
+        "message": "Keine passenden Aenderungen erkannt." if not events else f"{len(events)} Aenderungen erkannt, {len(strong)} starke Kandidaten.",
     }
 
 
@@ -722,6 +921,45 @@ def _handle_get_state(args: dict, **kw) -> str:
         return tool_error(f"Failed to get state for {entity_id}: {e}")
 
 
+def _handle_detect_capabilities(args: dict, **kw) -> str:
+    """Handler for ha_detect_capabilities tool."""
+    try:
+        result = _run_async(_async_detect_capabilities())
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_detect_capabilities error: %s", e)
+        return tool_error(f"Failed to detect Home Assistant capabilities: {e}")
+
+
+def _handle_observe_changes(args: dict, **kw) -> str:
+    """Handler for ha_observe_changes tool."""
+    duration = args.get("duration_seconds", 10)
+    include_domains = args.get("include_domains") or []
+    ignore_domains = args.get("ignore_domains") or []
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        return tool_error("duration_seconds must be an integer")
+    if duration < 3 or duration > 20:
+        return tool_error("duration_seconds must be between 3 and 20")
+    if not isinstance(include_domains, list):
+        return tool_error("include_domains must be a list of domain strings")
+    if not isinstance(ignore_domains, list):
+        return tool_error("ignore_domains must be a list of domain strings")
+    try:
+        result = _run_async(
+            _async_observe_changes(
+                duration_seconds=duration,
+                include_domains=include_domains,
+                ignore_domains=ignore_domains,
+            )
+        )
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_observe_changes error: %s", e)
+        return tool_error(f"Failed to observe Home Assistant changes: {e}")
+
+
 def _handle_list_areas(args: dict, **kw) -> str:
     """Handler for ha_list_areas tool."""
     try:
@@ -1022,6 +1260,50 @@ HA_GET_STATE_SCHEMA = {
     },
 }
 
+HA_DETECT_CAPABILITIES_SCHEMA = {
+    "name": "ha_detect_capabilities",
+    "description": (
+        "Detect configured Home Assistant integrations relevant for onboarding, "
+        "including MQTT, Matter, and Homematic."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+HA_OBSERVE_CHANGES_SCHEMA = {
+    "name": "ha_observe_changes",
+    "description": (
+        "Briefly listen to Home Assistant state_changed events to identify which "
+        "device or entity the user just touched. Best used after telling the user "
+        "to press a button, open a contact sensor, move a motion sensor, or switch a device."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "duration_seconds": {
+                "type": "integer",
+                "minimum": 3,
+                "maximum": 20,
+                "description": "Listening window in seconds. Use 10 by default; maximum 20.",
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional HA domains to include, e.g. ['binary_sensor', 'switch', 'button'].",
+            },
+            "ignore_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional extra HA domains to ignore.",
+            },
+        },
+        "required": [],
+    },
+}
+
 HA_LIST_AREAS_SCHEMA = {
     "name": "ha_list_areas",
     "description": "List Home Assistant areas via the area registry WebSocket API.",
@@ -1280,6 +1562,24 @@ registry.register(
     toolset="homeassistant",
     schema=HA_GET_STATE_SCHEMA,
     handler=_handle_get_state,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_detect_capabilities",
+    toolset="homeassistant",
+    schema=HA_DETECT_CAPABILITIES_SCHEMA,
+    handler=_handle_detect_capabilities,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_observe_changes",
+    toolset="homeassistant",
+    schema=HA_OBSERVE_CHANGES_SCHEMA,
+    handler=_handle_observe_changes,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
