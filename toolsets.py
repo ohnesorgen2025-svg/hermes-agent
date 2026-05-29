@@ -62,7 +62,7 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     "ha_detect_capabilities", "ha_observe_changes",
     "ha_list_areas", "ha_create_area", "ha_assign_area",
-    "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_integration_manage",
+    "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_update_manage", "ha_integration_manage",
     "ha_entity_rename", "ha_zigbee_manage", "ha_matter_manage",
     # Kanban multi-agent coordination — only in schema when the agent is
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
@@ -228,7 +228,7 @@ TOOLSETS = {
 
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
-        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "ha_detect_capabilities", "ha_observe_changes", "ha_list_areas", "ha_create_area", "ha_assign_area", "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_integration_manage", "ha_entity_rename", "ha_zigbee_manage", "ha_matter_manage"],
+        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "ha_detect_capabilities", "ha_observe_changes", "ha_list_areas", "ha_create_area", "ha_assign_area", "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_update_manage", "ha_integration_manage", "ha_entity_rename", "ha_zigbee_manage", "ha_matter_manage"],
         "includes": []
     },
 
@@ -370,7 +370,7 @@ TOOLSETS = {
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
             "ha_detect_capabilities", "ha_observe_changes",
             "ha_list_areas", "ha_create_area", "ha_assign_area",
-            "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_integration_manage",
+            "ha_automation_manage", "ha_dashboard_manage", "ha_supervisor_manage", "ha_update_manage", "ha_integration_manage",
             "ha_entity_rename", "ha_zigbee_manage", "ha_matter_manage",
 
         ],

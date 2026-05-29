@@ -13,6 +13,7 @@ Registers LLM-callable tools:
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
 - ``ha_dashboard_manage`` -- create, read, save, and manage Lovelace dashboards
 - ``ha_supervisor_manage`` -- manage HA Supervisor, add-ons, updates, logs, and backups
+- ``ha_update_manage`` -- inspect and install Home Assistant update entities, including HACS updates
 - ``ha_integration_manage`` -- inspect integrations, repairs, and reload config entries
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
 - ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
@@ -665,7 +666,10 @@ async def _supervisor_request(method: str, path: str, data: Optional[Dict[str, A
         async with session.request(method, url, headers=headers, json=data if data is not None else None, timeout=aiohttp.ClientTimeout(total=60)) as resp:
             text = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"Supervisor API {method} {clean_path} failed with {resp.status}: {text[:500]}")
+                hint = ""
+                if resp.status == 403:
+                    hint = " Add-on needs Supervisor API permission (`hassio_api: true`) and must be updated/restarted."
+                raise RuntimeError(f"Supervisor API {method} {clean_path} failed with {resp.status}: {text[:500]}{hint}")
             if not text:
                 return {"success": True, "status": resp.status}
             try:
@@ -756,6 +760,197 @@ async def _async_supervisor_manage(action: str, args: Dict[str, Any]) -> Dict[st
             raise ValueError("raw_request path must start with /")
         return await _supervisor_request(method, path, data)
     raise ValueError(f"Unsupported supervisor action: {action}")
+
+
+def _supervisor_payload_data(payload: Dict[str, Any]) -> Any:
+    """Return Supervisor response data when wrapped in the usual success/data envelope."""
+    response = payload.get("response") if isinstance(payload, dict) else None
+    if isinstance(response, dict) and "data" in response:
+        return response["data"]
+    return response
+
+
+async def _async_list_update_entities() -> list[Dict[str, Any]]:
+    """Return Home Assistant update.* entities with their useful attributes."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    url = f"{hass_url}/api/states"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            resp.raise_for_status()
+            states = await resp.json()
+
+    updates = []
+    for state in states if isinstance(states, list) else []:
+        entity_id = str(state.get("entity_id") or "")
+        if not entity_id.startswith("update."):
+            continue
+        attrs = state.get("attributes") if isinstance(state.get("attributes"), dict) else {}
+        updates.append({
+            "entity_id": entity_id,
+            "state": state.get("state"),
+            "available": state.get("state") == "on",
+            "title": attrs.get("title") or attrs.get("friendly_name") or entity_id,
+            "installed_version": attrs.get("installed_version"),
+            "latest_version": attrs.get("latest_version"),
+            "release_url": attrs.get("release_url"),
+            "skipped_version": attrs.get("skipped_version"),
+            "auto_update": attrs.get("auto_update"),
+            "device_class": attrs.get("device_class"),
+            "entity_picture": attrs.get("entity_picture"),
+        })
+    return updates
+
+
+def _filter_update_entities(updates: list[Dict[str, Any]], args: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Filter update entities for bulk installation."""
+    only_available = bool(args.get("only_available", True))
+    include_hacs = bool(args.get("include_hacs", True))
+    include_core = bool(args.get("include_core", True))
+    raw_entity_ids = args.get("entity_ids") or args.get("entity_id")
+    if isinstance(raw_entity_ids, str):
+        entity_ids = {item.strip() for item in raw_entity_ids.split(",") if item.strip()}
+    elif isinstance(raw_entity_ids, list):
+        entity_ids = {str(item).strip() for item in raw_entity_ids if str(item).strip()}
+    else:
+        entity_ids = set()
+    include_text = str(args.get("include") or "").strip().lower()
+    exclude_text = str(args.get("exclude") or "").strip().lower()
+
+    selected = []
+    for update in updates:
+        entity_id = update["entity_id"]
+        searchable = f"{entity_id} {update.get('title') or ''}".lower()
+        if only_available and not update.get("available"):
+            continue
+        if entity_ids and entity_id not in entity_ids:
+            continue
+        if not include_hacs and "hacs" in searchable:
+            continue
+        if not include_core and any(token in searchable for token in ("home_assistant_core", "home assistant core", "supervisor", "operating_system", "operating system")):
+            continue
+        if include_text and include_text not in searchable:
+            continue
+        if exclude_text and exclude_text in searchable:
+            continue
+        selected.append(update)
+    return selected
+
+
+async def _async_install_update_entity(entity_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Install one Home Assistant update entity via update.install."""
+    if not _ENTITY_ID_RE.match(entity_id) or not entity_id.startswith("update."):
+        raise ValueError(f"Invalid update entity_id: {entity_id}")
+    service_data: Dict[str, Any] = {}
+    if "version" in args and args.get("version"):
+        service_data["version"] = args["version"]
+    if "backup" in args:
+        service_data["backup"] = bool(args.get("backup"))
+    return await _async_call_service("update", "install", entity_id, service_data)
+
+
+async def _async_update_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Manage Home Assistant updates across Supervisor and update.* entities."""
+    if action in {"list_updates", "status"}:
+        updates = await _async_list_update_entities()
+        result: Dict[str, Any] = {
+            "success": True,
+            "updates": updates,
+            "available": [item for item in updates if item.get("available")],
+            "count": len(updates),
+            "available_count": sum(1 for item in updates if item.get("available")),
+        }
+        if action == "status":
+            for key, supervisor_action in (("core", "core_info"), ("supervisor", "supervisor_info"), ("os", "os_info"), ("addons", "list_addons")):
+                try:
+                    result[key] = await _async_supervisor_manage(supervisor_action, {})
+                except Exception as e:
+                    result[key] = {"error": str(e)}
+        return result
+
+    if action == "install_update":
+        entity_id = str(args.get("entity_id") or "").strip()
+        if not entity_id:
+            raise ValueError("Missing update entity_id")
+        return {"success": True, "entity_id": entity_id, "result": await _async_install_update_entity(entity_id, args)}
+
+    if action == "install_updates":
+        updates = await _async_list_update_entities()
+        selected = _filter_update_entities(updates, args)
+        results = []
+        for update in selected:
+            entity_id = update["entity_id"]
+            try:
+                results.append({"entity_id": entity_id, "success": True, "result": await _async_install_update_entity(entity_id, args)})
+            except Exception as e:
+                results.append({"entity_id": entity_id, "success": False, "error": str(e)})
+        return {"success": all(item.get("success") for item in results), "selected_count": len(selected), "results": results}
+
+    if action == "update_everything":
+        backup = bool(args.get("backup", True))
+        force_without_backup = bool(args.get("force_without_backup", False))
+        backup_result: Optional[Dict[str, Any]] = None
+        if backup:
+            try:
+                backup_result = await _async_supervisor_manage("create_backup", {"backup_type": args.get("backup_type") or "full"})
+            except Exception as e:
+                if not force_without_backup:
+                    return {
+                        "success": False,
+                        "blocked": True,
+                        "stage": "backup",
+                        "error": str(e),
+                        "message": "Backup failed; update_everything stopped. Confirm force_without_backup=true to proceed anyway.",
+                    }
+                backup_result = {"success": False, "error": str(e), "forced_continue": True}
+
+        supervisor_results: Dict[str, Any] = {}
+        for supervisor_action in ("update_core", "update_supervisor", "update_os"):
+            if bool(args.get(supervisor_action, True)):
+                try:
+                    supervisor_results[supervisor_action] = await _async_supervisor_manage(supervisor_action, {})
+                except Exception as e:
+                    supervisor_results[supervisor_action] = {"success": False, "error": str(e)}
+
+        addon_results = []
+        if bool(args.get("addons", True)):
+            try:
+                addon_payload = await _async_supervisor_manage("list_addons", {})
+                addon_data = _supervisor_payload_data(addon_payload)
+                addons = addon_data.get("addons", []) if isinstance(addon_data, dict) else []
+                for addon in addons if isinstance(addons, list) else []:
+                    if not isinstance(addon, dict) or not addon.get("update_available"):
+                        continue
+                    slug = str(addon.get("slug") or addon.get("name") or "").strip()
+                    if not slug:
+                        continue
+                    try:
+                        addon_results.append({"addon": slug, "success": True, "result": await _async_supervisor_manage("update_addon", {"addon": slug})})
+                    except Exception as e:
+                        addon_results.append({"addon": slug, "success": False, "error": str(e)})
+            except Exception as e:
+                addon_results.append({"success": False, "error": str(e)})
+
+        entity_result = None
+        if bool(args.get("update_entities", True)):
+            entity_args = dict(args)
+            entity_args.setdefault("backup", False)
+            entity_result = await _async_update_manage("install_updates", entity_args)
+
+        failures = [value for value in supervisor_results.values() if isinstance(value, dict) and value.get("success") is False]
+        failures.extend(item for item in addon_results if isinstance(item, dict) and item.get("success") is False)
+        if isinstance(entity_result, dict):
+            failures.extend(item for item in entity_result.get("results", []) if isinstance(item, dict) and item.get("success") is False)
+        return {
+            "success": not failures,
+            "backup": backup_result,
+            "supervisor": supervisor_results,
+            "addons": addon_results,
+            "update_entities": entity_result,
+        }
+
+    raise ValueError(f"Unsupported update action: {action}")
 
 
 async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1594,6 +1789,17 @@ def _handle_supervisor_manage(args: dict, **kw) -> str:
         return tool_error(f"Failed to manage Home Assistant Supervisor: {e}")
 
 
+def _handle_update_manage(args: dict, **kw) -> str:
+    """Handler for ha_update_manage tool."""
+    action = args.get("action", "")
+    try:
+        result = _run_async(_async_update_manage(action, args))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_update_manage error: %s", e)
+        return tool_error(f"Failed to manage Home Assistant updates: {e}")
+
+
 def _handle_dashboard_manage(args: dict, **kw) -> str:
     """Handler for ha_dashboard_manage tool."""
     action = args.get("action", "")
@@ -1779,6 +1985,41 @@ HA_SUPERVISOR_MANAGE_SCHEMA = {
             "method": {"type": "string", "description": "HTTP method for raw_request."},
             "path": {"type": "string", "description": "Supervisor API path for raw_request, starting with /."},
             "data": {"type": "object", "description": "Optional request body."},
+        },
+        "required": ["action"],
+    },
+}
+
+HA_UPDATE_MANAGE_SCHEMA = {
+    "name": "ha_update_manage",
+    "description": (
+        "Inspect and install Home Assistant updates. Handles update.* entities, including HACS updates, "
+        "and can coordinate Supervisor/Core/OS/add-on updates with a backup-first workflow. "
+        "Ask for user confirmation before installing updates."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "list_updates", "install_update", "install_updates", "update_everything"],
+            },
+            "entity_id": {"type": "string", "description": "Single update.* entity to install."},
+            "entity_ids": {"type": ["array", "string"], "description": "Comma-separated string or array of update.* entities to install."},
+            "include": {"type": "string", "description": "Optional text filter for bulk update entity installs."},
+            "exclude": {"type": "string", "description": "Optional text filter to exclude update entities."},
+            "only_available": {"type": "boolean", "description": "Only install entities whose state is on. Default true."},
+            "include_hacs": {"type": "boolean", "description": "Include HACS update entities in bulk installs. Default true."},
+            "include_core": {"type": "boolean", "description": "Include core/supervisor/os update entities in bulk installs. Default true."},
+            "version": {"type": "string", "description": "Optional version passed to update.install."},
+            "backup": {"type": "boolean", "description": "Create a Supervisor backup before update_everything; default true. Passed to update.install when explicitly set."},
+            "backup_type": {"type": "string", "enum": ["full", "partial"], "description": "Backup type for update_everything. Default full."},
+            "force_without_backup": {"type": "boolean", "description": "Proceed with update_everything if backup creation fails."},
+            "update_core": {"type": "boolean", "description": "Include Supervisor Core update in update_everything. Default true."},
+            "update_supervisor": {"type": "boolean", "description": "Include Supervisor update in update_everything. Default true."},
+            "update_os": {"type": "boolean", "description": "Include OS update in update_everything. Default true."},
+            "addons": {"type": "boolean", "description": "Include Supervisor add-on updates in update_everything. Default true."},
+            "update_entities": {"type": "boolean", "description": "Include update.* entities such as HACS in update_everything. Default true."},
         },
         "required": ["action"],
     },
@@ -2131,6 +2372,15 @@ registry.register(
     toolset="homeassistant",
     schema=HA_SUPERVISOR_MANAGE_SCHEMA,
     handler=_handle_supervisor_manage,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_update_manage",
+    toolset="homeassistant",
+    schema=HA_UPDATE_MANAGE_SCHEMA,
+    handler=_handle_update_manage,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
