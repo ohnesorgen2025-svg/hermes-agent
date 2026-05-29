@@ -675,6 +675,35 @@ async def _supervisor_request(method: str, path: str, data: Optional[Dict[str, A
             return {"success": True, "status": resp.status, "response": parsed}
 
 
+async def _ha_request(method: str, path: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Call the Home Assistant REST API and return a parsed response."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    clean_path = path if path.startswith("/") else f"/{path}"
+    url = f"{hass_url}{clean_path}"
+    method = method.upper()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.request(
+            method,
+            url,
+            headers=_get_headers(hass_token),
+            json=data if data is not None else None,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Home Assistant API {method} {clean_path} failed with {resp.status}: {text[:500]}")
+            if not text:
+                return {"success": True, "status": resp.status}
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = text
+            return {"success": True, "status": resp.status, "response": parsed}
+
+
 async def _async_supervisor_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Manage Home Assistant Supervisor, add-ons, updates, logs, and backups."""
     addon = str(args.get("addon") or args.get("slug") or "").strip()
@@ -732,12 +761,32 @@ async def _async_supervisor_manage(action: str, args: Dict[str, Any]) -> Dict[st
 async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Manage Lovelace dashboards via Home Assistant WebSocket commands."""
     url_path = str(args.get("url_path") or args.get("dashboard") or "").strip().strip("/")
+    dashboard_id = str(args.get("dashboard_id") or args.get("id") or url_path).strip().strip("/")
     config = args.get("config")
+    metadata_keys = ("title", "icon", "show_in_sidebar", "require_admin")
+
+    def dashboard_api_path() -> str:
+        from urllib.parse import quote
+
+        if not dashboard_id:
+            raise ValueError("Missing dashboard_id or url_path")
+        return f"/api/lovelace/dashboards/{quote(dashboard_id, safe='')}"
+
+    def config_url_path() -> str:
+        if url_path:
+            return url_path
+        if dashboard_id and dashboard_id != "lovelace":
+            return dashboard_id
+        return ""
+
+    def metadata_patch() -> Dict[str, Any]:
+        return {key: args[key] for key in metadata_keys if key in args}
 
     async def get_config() -> Any:
         payload: Dict[str, Any] = {"type": "lovelace/config"}
-        if url_path:
-            payload["url_path"] = url_path
+        target = config_url_path()
+        if target:
+            payload["url_path"] = target
         return await _ws_command(payload)
 
     if action == "list_dashboards":
@@ -753,6 +802,7 @@ async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str
             raise ValueError("Missing dashboard title")
         if not url_path:
             url_path = re.sub(r"[^a-z0-9_]+", "-", title.lower()).strip("-") or "hermes-dashboard"
+        backup_path = _backup_json("dashboard", "dashboards-list", await _ws_command({"type": "lovelace/dashboards/list"}))
         payload = {
             "type": "lovelace/dashboards/create",
             "url_path": url_path,
@@ -763,35 +813,50 @@ async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str
         icon = args.get("icon")
         if icon:
             payload["icon"] = icon
-        return {"success": True, "dashboard": await _ws_command(payload), "url_path": url_path}
+        return {"success": True, "backup_path": backup_path, "dashboard": await _ws_command(payload), "url_path": url_path}
     if action == "update_dashboard":
-        if not url_path:
-            raise ValueError("Missing dashboard url_path")
-        payload = {"type": "lovelace/dashboards/update", "url_path": url_path}
-        for key in ("title", "icon", "show_in_sidebar", "mode"):
-            if key in args:
-                payload[key] = args[key]
-        return {"success": True, "dashboard": await _ws_command(payload)}
+        patch = metadata_patch()
+        if isinstance(config, str):
+            config = json.loads(config)
+        if config is not None and not isinstance(config, dict):
+            raise ValueError("Dashboard config must be an object")
+        if not patch and config is None:
+            raise ValueError("Missing dashboard metadata fields or config")
+        if patch:
+            dashboard_api_path()
+        backup_path = _backup_json("dashboard", url_path or dashboard_id or "default", await get_config())
+        result: Dict[str, Any] = {}
+        if config is not None:
+            payload = {"type": "lovelace/config/save", "config": config}
+            target = config_url_path()
+            if target:
+                payload["url_path"] = target
+            result["config_save"] = await _ws_command(payload)
+        if patch:
+            result["metadata_update"] = await _ha_request("PUT", dashboard_api_path(), patch)
+        return {"success": True, "backup_path": backup_path, "result": result}
     if action == "delete_dashboard":
-        if not url_path:
-            raise ValueError("Missing dashboard url_path")
+        dashboard_api_path()
         current = await get_config()
-        backup_path = _backup_json("dashboard", url_path, current)
-        return {"success": True, "backup_path": backup_path, "result": await _ws_command({"type": "lovelace/dashboards/delete", "url_path": url_path})}
+        backup_path = _backup_json("dashboard", url_path or dashboard_id, current)
+        return {"success": True, "backup_path": backup_path, "result": await _ha_request("DELETE", dashboard_api_path())}
     if action == "save_dashboard":
         if isinstance(config, str):
             config = json.loads(config)
         if not isinstance(config, dict):
             raise ValueError("Missing dashboard config object")
-        backup_path = None
-        try:
-            backup_path = _backup_json("dashboard", url_path or "default", await get_config())
-        except Exception as e:
-            logger.warning("Could not backup dashboard before save: %s", e)
+        patch = metadata_patch()
+        if patch:
+            dashboard_api_path()
+        backup_path = _backup_json("dashboard", url_path or dashboard_id or "default", await get_config())
         payload = {"type": "lovelace/config/save", "config": config}
-        if url_path:
-            payload["url_path"] = url_path
-        return {"success": True, "backup_path": backup_path, "result": await _ws_command(payload)}
+        target = config_url_path()
+        if target:
+            payload["url_path"] = target
+        result = {"config_save": await _ws_command(payload)}
+        if patch:
+            result["metadata_update"] = await _ha_request("PUT", dashboard_api_path(), patch)
+        return {"success": True, "backup_path": backup_path, "result": result}
     if action in {"add_view", "update_view", "delete_view", "add_card", "update_card", "delete_card"}:
         current = await get_config()
         if not isinstance(current, dict):
@@ -1723,7 +1788,7 @@ HA_DASHBOARD_MANAGE_SCHEMA = {
     "name": "ha_dashboard_manage",
     "description": (
         "Create, read, update, delete, and fully save Home Assistant Lovelace dashboards. "
-        "Backs up dashboard JSON before destructive writes where possible. Ask for user confirmation before writes."
+        "Backs up dashboard JSON before writes where possible. Ask for user confirmation before writes."
     ),
     "parameters": {
         "type": "object",
@@ -1738,10 +1803,13 @@ HA_DASHBOARD_MANAGE_SCHEMA = {
             },
             "url_path": {"type": "string", "description": "Dashboard URL path/slug. Omit for the default dashboard."},
             "dashboard": {"type": "string", "description": "Alias for url_path."},
+            "dashboard_id": {"type": "string", "description": "Dashboard storage ID for REST metadata operations. Defaults to url_path."},
+            "id": {"type": "string", "description": "Alias for dashboard_id."},
             "title": {"type": "string"},
             "icon": {"type": "string"},
             "mode": {"type": "string", "description": "Dashboard mode, usually storage or yaml."},
             "show_in_sidebar": {"type": "boolean"},
+            "require_admin": {"type": "boolean"},
             "config": {"type": ["object", "string"], "description": "Full Lovelace config for save_dashboard."},
             "view_index": {"type": "integer"},
             "view": {"type": ["object", "string"], "description": "View object or patch."},
