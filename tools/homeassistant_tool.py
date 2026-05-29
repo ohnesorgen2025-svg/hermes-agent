@@ -1286,49 +1286,88 @@ async def _async_automation_manage(
     automation_id: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Manage Home Assistant automations through config REST endpoints."""
+    """Manage Home Assistant automations through WebSocket config commands."""
     import aiohttp
 
     hass_url, hass_token = _get_config()
     base_url = f"{hass_url}/api/config/automation/config"
 
-    async with aiohttp.ClientSession() as session:
+    async def rest_fallback() -> Dict[str, Any]:
+        async with aiohttp.ClientSession() as session:
+            if action == "list":
+                async with session.get(base_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+                return {"success": True, "action": action, "source": "rest", "automations": result, "count": len(result) if isinstance(result, list) else None}
+
+            normalized_id = _normalize_automation_id(automation_id or "")
+            automation_url = f"{base_url}/{normalized_id}"
+
+            if action == "get":
+                async with session.get(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result}
+
+            if action in {"create", "update"}:
+                async with session.post(
+                    automation_url,
+                    headers=_get_headers(hass_token),
+                    json=config,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+                await _async_reload_automations(session, hass_url, hass_token)
+                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result, "reloaded": True}
+
+            if action == "delete":
+                async with session.delete(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    try:
+                        result = await resp.json()
+                    except aiohttp.ContentTypeError:
+                        result = None
+                await _async_reload_automations(session, hass_url, hass_token)
+                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "result": result, "reloaded": True}
+
+        raise ValueError(f"Unsupported action: {action}")
+
+    try:
         if action == "list":
-            async with session.get(base_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-            return {"success": True, "action": action, "automations": result, "count": len(result) if isinstance(result, list) else None}
+            result = await _ws_command({"type": "automation/config/list"})
+            return {"success": True, "action": action, "source": "websocket", "automations": result, "count": len(result) if isinstance(result, list) else None}
 
         normalized_id = _normalize_automation_id(automation_id or "")
-        automation_url = f"{base_url}/{normalized_id}"
 
         if action == "get":
-            async with session.get(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-            return {"success": True, "action": action, "automation_id": normalized_id, "automation": result}
+            result = await _ws_command({"type": "automation/config/item", "id": normalized_id})
+            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "automation": result}
 
         if action in {"create", "update"}:
-            async with session.post(
-                automation_url,
-                headers=_get_headers(hass_token),
-                json=config,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-            await _async_reload_automations(session, hass_url, hass_token)
-            return {"success": True, "action": action, "automation_id": normalized_id, "automation": result, "reloaded": True}
+            if not isinstance(config, dict):
+                raise ValueError("Missing or invalid required parameter: config")
+            payload = {"type": "automation/config/save", "id": normalized_id, "config": config}
+            result = await _ws_command(payload)
+            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "automation": result, "reloaded": True}
 
         if action == "delete":
-            async with session.delete(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                resp.raise_for_status()
-                try:
-                    result = await resp.json()
-                except aiohttp.ContentTypeError:
-                    result = None
-            await _async_reload_automations(session, hass_url, hass_token)
-            return {"success": True, "action": action, "automation_id": normalized_id, "result": result, "reloaded": True}
+            result = await _ws_command({"type": "automation/config/delete", "id": normalized_id})
+            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "result": result, "reloaded": True}
+
+    except ValueError:
+        raise
+    except Exception as ws_error:
+        logger.warning("Automation WebSocket config API failed; trying REST fallback: %s", ws_error)
+        try:
+            result = await rest_fallback()
+            result["websocket_error"] = str(ws_error)
+            return result
+        except Exception as rest_error:
+            raise RuntimeError(
+                f"Automation config read/write failed via WebSocket and REST. "
+                f"WebSocket error: {ws_error}. REST error: {rest_error}"
+            ) from rest_error
 
     raise ValueError(f"Unsupported action: {action}")
 
@@ -2207,9 +2246,9 @@ HA_AUTOMATION_MANAGE_SCHEMA = {
     "name": "ha_automation_manage",
     "description": (
         "Manage Home Assistant automations. List, get, create, update, or delete "
-        "automation configs via the Home Assistant config API. Create and update "
-        "reload automations automatically. For safety, shell_command, command_line, "
-        "and python_script services are blocked in automation actions."
+        "full automation configs, including triggers, conditions, and actions, through "
+        "Home Assistant's automation WebSocket config API with REST fallback. For safety, "
+        "shell_command, command_line, and python_script services are blocked in automation actions."
     ),
     "parameters": {
         "type": "object",
