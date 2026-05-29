@@ -11,6 +11,9 @@ Registers LLM-callable tools:
 - ``ha_list_services`` -- list available services (actions) per domain
 - ``ha_call_service`` -- call a HA service (turn_on, turn_off, set_temperature, etc.)
 - ``ha_automation_manage`` -- list, read, create, update, and delete automations
+- ``ha_dashboard_manage`` -- create, read, save, and manage Lovelace dashboards
+- ``ha_supervisor_manage`` -- manage HA Supervisor, add-ons, updates, logs, and backups
+- ``ha_integration_manage`` -- inspect integrations, repairs, and reload config entries
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
 - ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
 - ``ha_matter_manage`` -- expose/unexpose entities to Matter Hub via labels
@@ -25,6 +28,8 @@ import logging
 import os
 import re
 import threading
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -102,6 +107,28 @@ def _get_mqtt_config() -> tuple[str, int, Optional[str], Optional[str]]:
         os.getenv("MQTT_USER"),
         os.getenv("MQTT_PASSWORD"),
     )
+
+
+def _get_supervisor_config() -> tuple[str, str]:
+    """Return (supervisor_url, token) for Home Assistant Supervisor API calls."""
+    _, hass_token = _get_config()
+    return os.getenv("SUPERVISOR_URL", "http://supervisor").rstrip("/"), os.getenv("SUPERVISOR_TOKEN", hass_token)
+
+
+def _get_hermes_home() -> Path:
+    """Return Hermes home for local add-on managed backups."""
+    return Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")))
+
+
+def _backup_json(category: str, name: str, payload: Any) -> str:
+    """Write a JSON backup below HERMES_HOME and return the path."""
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name).strip("_") or "backup"
+    backup_dir = _get_hermes_home() / f"{category}-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"{safe_name}-{timestamp}.json"
+    backup_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return str(backup_path)
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +649,246 @@ async def _async_matter_manage(action: str, entity_id: Optional[str] = None) -> 
         "entity": result,
         "message": message,
     }
+
+
+async def _supervisor_request(method: str, path: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Call the Home Assistant Supervisor API."""
+    import aiohttp
+
+    supervisor_url, token = _get_supervisor_config()
+    clean_path = path if path.startswith("/") else f"/{path}"
+    url = f"{supervisor_url}{clean_path}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    method = method.upper()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.request(method, url, headers=headers, json=data if data is not None else None, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Supervisor API {method} {clean_path} failed with {resp.status}: {text[:500]}")
+            if not text:
+                return {"success": True, "status": resp.status}
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = text
+            return {"success": True, "status": resp.status, "response": parsed}
+
+
+async def _async_supervisor_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Manage Home Assistant Supervisor, add-ons, updates, logs, and backups."""
+    addon = str(args.get("addon") or args.get("slug") or "").strip()
+    data = args.get("data") if isinstance(args.get("data"), dict) else None
+
+    if action == "info":
+        return await _supervisor_request("GET", "/info")
+    if action == "list_addons":
+        return await _supervisor_request("GET", "/addons")
+    if action == "addon_info":
+        if not addon:
+            raise ValueError("Missing addon slug")
+        return await _supervisor_request("GET", f"/addons/{addon}/info")
+    if action in {"install_addon", "uninstall_addon", "start_addon", "stop_addon", "restart_addon", "update_addon"}:
+        if not addon:
+            raise ValueError("Missing addon slug")
+        endpoint = {
+            "install_addon": "install",
+            "uninstall_addon": "uninstall",
+            "start_addon": "start",
+            "stop_addon": "stop",
+            "restart_addon": "restart",
+            "update_addon": "update",
+        }[action]
+        return await _supervisor_request("POST", f"/addons/{addon}/{endpoint}", data or {})
+    if action == "addon_logs":
+        if not addon:
+            raise ValueError("Missing addon slug")
+        return await _supervisor_request("GET", f"/addons/{addon}/logs")
+    if action == "core_info":
+        return await _supervisor_request("GET", "/core/info")
+    if action == "supervisor_info":
+        return await _supervisor_request("GET", "/supervisor/info")
+    if action == "os_info":
+        return await _supervisor_request("GET", "/os/info")
+    if action in {"update_core", "update_supervisor", "update_os"}:
+        path = {"update_core": "/core/update", "update_supervisor": "/supervisor/update", "update_os": "/os/update"}[action]
+        return await _supervisor_request("POST", path, data or {})
+    if action == "create_backup":
+        backup_type = str(args.get("backup_type") or "full").strip().lower()
+        if backup_type not in {"full", "partial"}:
+            raise ValueError("backup_type must be full or partial")
+        return await _supervisor_request("POST", f"/backups/new/{backup_type}", data or {})
+    if action == "list_backups":
+        return await _supervisor_request("GET", "/backups")
+    if action == "raw_request":
+        method = str(args.get("method") or "GET")
+        path = str(args.get("path") or "").strip()
+        if not path.startswith("/"):
+            raise ValueError("raw_request path must start with /")
+        return await _supervisor_request(method, path, data)
+    raise ValueError(f"Unsupported supervisor action: {action}")
+
+
+async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Manage Lovelace dashboards via Home Assistant WebSocket commands."""
+    url_path = str(args.get("url_path") or args.get("dashboard") or "").strip().strip("/")
+    config = args.get("config")
+
+    async def get_config() -> Any:
+        payload: Dict[str, Any] = {"type": "lovelace/config"}
+        if url_path:
+            payload["url_path"] = url_path
+        return await _ws_command(payload)
+
+    if action == "list_dashboards":
+        return {"success": True, "dashboards": await _ws_command({"type": "lovelace/dashboards/list"})}
+    if action == "get_dashboard":
+        return {"success": True, "url_path": url_path or None, "config": await get_config()}
+    if action == "backup_dashboard":
+        current = await get_config()
+        return {"success": True, "url_path": url_path or None, "backup_path": _backup_json("dashboard", url_path or "default", current)}
+    if action == "create_dashboard":
+        title = str(args.get("title") or "").strip()
+        if not title:
+            raise ValueError("Missing dashboard title")
+        if not url_path:
+            url_path = re.sub(r"[^a-z0-9_]+", "-", title.lower()).strip("-") or "hermes-dashboard"
+        payload = {
+            "type": "lovelace/dashboards/create",
+            "url_path": url_path,
+            "title": title,
+            "mode": str(args.get("mode") or "storage"),
+            "show_in_sidebar": bool(args.get("show_in_sidebar", True)),
+        }
+        icon = args.get("icon")
+        if icon:
+            payload["icon"] = icon
+        return {"success": True, "dashboard": await _ws_command(payload), "url_path": url_path}
+    if action == "update_dashboard":
+        if not url_path:
+            raise ValueError("Missing dashboard url_path")
+        payload = {"type": "lovelace/dashboards/update", "url_path": url_path}
+        for key in ("title", "icon", "show_in_sidebar", "mode"):
+            if key in args:
+                payload[key] = args[key]
+        return {"success": True, "dashboard": await _ws_command(payload)}
+    if action == "delete_dashboard":
+        if not url_path:
+            raise ValueError("Missing dashboard url_path")
+        current = await get_config()
+        backup_path = _backup_json("dashboard", url_path, current)
+        return {"success": True, "backup_path": backup_path, "result": await _ws_command({"type": "lovelace/dashboards/delete", "url_path": url_path})}
+    if action == "save_dashboard":
+        if isinstance(config, str):
+            config = json.loads(config)
+        if not isinstance(config, dict):
+            raise ValueError("Missing dashboard config object")
+        backup_path = None
+        try:
+            backup_path = _backup_json("dashboard", url_path or "default", await get_config())
+        except Exception as e:
+            logger.warning("Could not backup dashboard before save: %s", e)
+        payload = {"type": "lovelace/config/save", "config": config}
+        if url_path:
+            payload["url_path"] = url_path
+        return {"success": True, "backup_path": backup_path, "result": await _ws_command(payload)}
+    if action in {"add_view", "update_view", "delete_view", "add_card", "update_card", "delete_card"}:
+        current = await get_config()
+        if not isinstance(current, dict):
+            raise ValueError("Dashboard config is not an object")
+        views = current.setdefault("views", [])
+        if not isinstance(views, list):
+            raise ValueError("Dashboard views is not a list")
+        view_index = int(args.get("view_index", 0))
+        if action == "add_view":
+            view = args.get("view")
+            if isinstance(view, str):
+                view = json.loads(view)
+            if not isinstance(view, dict):
+                raise ValueError("Missing view object")
+            views.append(view)
+        else:
+            if view_index < 0 or view_index >= len(views):
+                raise ValueError("view_index out of range")
+            if action == "update_view":
+                patch = args.get("view") or args.get("patch")
+                if isinstance(patch, str):
+                    patch = json.loads(patch)
+                if not isinstance(patch, dict):
+                    raise ValueError("Missing view patch object")
+                views[view_index].update(patch)
+            elif action == "delete_view":
+                views.pop(view_index)
+            else:
+                cards = views[view_index].setdefault("cards", [])
+                if not isinstance(cards, list):
+                    raise ValueError("View cards is not a list")
+                card_index = args.get("card_index")
+                if action == "add_card":
+                    card = args.get("card")
+                    if isinstance(card, str):
+                        card = json.loads(card)
+                    if not isinstance(card, dict):
+                        raise ValueError("Missing card object")
+                    cards.append(card)
+                else:
+                    card_index = int(card_index)
+                    if card_index < 0 or card_index >= len(cards):
+                        raise ValueError("card_index out of range")
+                    if action == "update_card":
+                        patch = args.get("card") or args.get("patch")
+                        if isinstance(patch, str):
+                            patch = json.loads(patch)
+                        if not isinstance(patch, dict):
+                            raise ValueError("Missing card patch object")
+                        cards[card_index].update(patch)
+                    elif action == "delete_card":
+                        cards.pop(card_index)
+        backup_path = _backup_json("dashboard", url_path or "default", await get_config())
+        payload = {"type": "lovelace/config/save", "config": current}
+        if url_path:
+            payload["url_path"] = url_path
+        return {"success": True, "backup_path": backup_path, "config": current, "result": await _ws_command(payload)}
+    if action == "raw_ws":
+        message = args.get("message")
+        if isinstance(message, str):
+            message = json.loads(message)
+        if not isinstance(message, dict):
+            raise ValueError("Missing raw WebSocket message object")
+        return {"success": True, "result": await _ws_command(message)}
+    raise ValueError(f"Unsupported dashboard action: {action}")
+
+
+async def _async_integration_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspect and manage Home Assistant integrations where HA exposes APIs."""
+    if action == "list_entries":
+        return {"success": True, "entries": await _ws_command({"type": "config_entries/get"})}
+    if action == "reload_entry":
+        entry_id = str(args.get("entry_id") or "").strip()
+        if not entry_id:
+            raise ValueError("Missing entry_id")
+        return {"success": True, "result": await _ws_command({"type": "config_entries/reload", "entry_id": entry_id})}
+    if action == "remove_entry":
+        entry_id = str(args.get("entry_id") or "").strip()
+        if not entry_id:
+            raise ValueError("Missing entry_id")
+        return {"success": True, "result": await _ws_command({"type": "config_entries/remove", "entry_id": entry_id})}
+    if action == "list_repairs":
+        return {"success": True, "issues": await _ws_command({"type": "repairs/list_issues"})}
+    if action == "ignore_repair":
+        issue_id = str(args.get("issue_id") or "").strip()
+        domain = str(args.get("domain") or "").strip()
+        if not issue_id or not domain:
+            raise ValueError("Missing domain or issue_id")
+        return {"success": True, "result": await _ws_command({"type": "repairs/ignore_issue", "domain": domain, "issue_id": issue_id})}
+    if action == "raw_ws":
+        message = args.get("message")
+        if isinstance(message, str):
+            message = json.loads(message)
+        if not isinstance(message, dict):
+            raise ValueError("Missing raw WebSocket message object")
+        return {"success": True, "result": await _ws_command(message)}
+    raise ValueError(f"Unsupported integration action: {action}")
 
 
 def _build_service_payload(
@@ -1251,6 +1518,39 @@ def _handle_zigbee_manage(args: dict, **kw) -> str:
         return tool_error(f"Failed to manage Zigbee2MQTT: {e}")
 
 
+def _handle_supervisor_manage(args: dict, **kw) -> str:
+    """Handler for ha_supervisor_manage tool."""
+    action = args.get("action", "")
+    try:
+        result = _run_async(_async_supervisor_manage(action, args))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_supervisor_manage error: %s", e)
+        return tool_error(f"Failed to manage Home Assistant Supervisor: {e}")
+
+
+def _handle_dashboard_manage(args: dict, **kw) -> str:
+    """Handler for ha_dashboard_manage tool."""
+    action = args.get("action", "")
+    try:
+        result = _run_async(_async_dashboard_manage(action, args))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_dashboard_manage error: %s", e)
+        return tool_error(f"Failed to manage Home Assistant dashboard: {e}")
+
+
+def _handle_integration_manage(args: dict, **kw) -> str:
+    """Handler for ha_integration_manage tool."""
+    action = args.get("action", "")
+    try:
+        result = _run_async(_async_integration_manage(action, args))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_integration_manage error: %s", e)
+        return tool_error(f"Failed to manage Home Assistant integrations: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
@@ -1386,6 +1686,93 @@ HA_CREATE_AREA_SCHEMA = {
             },
         },
         "required": ["name"],
+    },
+}
+
+HA_SUPERVISOR_MANAGE_SCHEMA = {
+    "name": "ha_supervisor_manage",
+    "description": (
+        "Full Home Assistant Supervisor administration: inspect system status, list and manage add-ons, "
+        "run Core/Supervisor/OS updates, create/list backups, read logs, and call raw Supervisor API endpoints. "
+        "Ask for user confirmation before destructive or disruptive actions."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "info", "list_addons", "addon_info", "install_addon", "uninstall_addon",
+                    "start_addon", "stop_addon", "restart_addon", "update_addon", "addon_logs",
+                    "core_info", "supervisor_info", "os_info", "update_core", "update_supervisor",
+                    "update_os", "create_backup", "list_backups", "raw_request",
+                ],
+            },
+            "addon": {"type": "string", "description": "Add-on slug, e.g. core_mosquitto."},
+            "slug": {"type": "string", "description": "Alias for addon slug."},
+            "backup_type": {"type": "string", "enum": ["full", "partial"]},
+            "method": {"type": "string", "description": "HTTP method for raw_request."},
+            "path": {"type": "string", "description": "Supervisor API path for raw_request, starting with /."},
+            "data": {"type": "object", "description": "Optional request body."},
+        },
+        "required": ["action"],
+    },
+}
+
+HA_DASHBOARD_MANAGE_SCHEMA = {
+    "name": "ha_dashboard_manage",
+    "description": (
+        "Create, read, update, delete, and fully save Home Assistant Lovelace dashboards. "
+        "Backs up dashboard JSON before destructive writes where possible. Ask for user confirmation before writes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list_dashboards", "create_dashboard", "update_dashboard", "delete_dashboard",
+                    "get_dashboard", "save_dashboard", "backup_dashboard", "add_view", "update_view",
+                    "delete_view", "add_card", "update_card", "delete_card", "raw_ws",
+                ],
+            },
+            "url_path": {"type": "string", "description": "Dashboard URL path/slug. Omit for the default dashboard."},
+            "dashboard": {"type": "string", "description": "Alias for url_path."},
+            "title": {"type": "string"},
+            "icon": {"type": "string"},
+            "mode": {"type": "string", "description": "Dashboard mode, usually storage or yaml."},
+            "show_in_sidebar": {"type": "boolean"},
+            "config": {"type": ["object", "string"], "description": "Full Lovelace config for save_dashboard."},
+            "view_index": {"type": "integer"},
+            "view": {"type": ["object", "string"], "description": "View object or patch."},
+            "card_index": {"type": "integer"},
+            "card": {"type": ["object", "string"], "description": "Card object or patch."},
+            "patch": {"type": ["object", "string"], "description": "Patch object for update actions."},
+            "message": {"type": ["object", "string"], "description": "Raw Home Assistant WebSocket message for raw_ws."},
+        },
+        "required": ["action"],
+    },
+}
+
+HA_INTEGRATION_MANAGE_SCHEMA = {
+    "name": "ha_integration_manage",
+    "description": (
+        "Inspect and manage Home Assistant integrations/config entries and repairs. "
+        "Some integrations require interactive config flows or OAuth and cannot be fully installed without user participation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list_entries", "reload_entry", "remove_entry", "list_repairs", "ignore_repair", "raw_ws"],
+            },
+            "entry_id": {"type": "string"},
+            "domain": {"type": "string"},
+            "issue_id": {"type": "string"},
+            "message": {"type": ["object", "string"], "description": "Raw Home Assistant WebSocket message for raw_ws."},
+        },
+        "required": ["action"],
     },
 }
 
@@ -1667,6 +2054,33 @@ registry.register(
     toolset="homeassistant",
     schema=HA_ASSIGN_AREA_SCHEMA,
     handler=_handle_assign_area,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_supervisor_manage",
+    toolset="homeassistant",
+    schema=HA_SUPERVISOR_MANAGE_SCHEMA,
+    handler=_handle_supervisor_manage,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_dashboard_manage",
+    toolset="homeassistant",
+    schema=HA_DASHBOARD_MANAGE_SCHEMA,
+    handler=_handle_dashboard_manage,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_integration_manage",
+    toolset="homeassistant",
+    schema=HA_INTEGRATION_MANAGE_SCHEMA,
+    handler=_handle_integration_manage,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
