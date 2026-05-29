@@ -14,6 +14,7 @@ Registers LLM-callable tools:
 - ``ha_dashboard_manage`` -- create, read, save, and manage Lovelace dashboards
 - ``ha_supervisor_manage`` -- manage HA Supervisor, add-ons, updates, logs, and backups
 - ``ha_update_manage`` -- inspect and install Home Assistant update entities, including HACS updates
+- ``ha_admin_diagnose`` -- diagnose HA admin API capabilities and likely fallback paths
 - ``ha_integration_manage`` -- inspect integrations, repairs, and reload config entries
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
 - ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
@@ -768,6 +769,138 @@ def _supervisor_payload_data(payload: Dict[str, Any]) -> Any:
     if isinstance(response, dict) and "data" in response:
         return response["data"]
     return response
+
+
+def _classify_admin_error(error: Exception) -> Dict[str, str]:
+    """Classify Home Assistant API failures into actionable admin categories."""
+    message = str(error)
+    lowered = message.lower()
+    if "403" in lowered or "forbidden" in lowered:
+        return {
+            "category": "permission",
+            "meaning": "The API path exists, but the token or add-on role lacks permission.",
+            "next_step": "Check add-on permissions such as hassio_api, hassio_role, or the Home Assistant token scope.",
+        }
+    if "404" in lowered or "not found" in lowered:
+        return {
+            "category": "missing_endpoint",
+            "meaning": "This Home Assistant version or proxy path does not expose that endpoint.",
+            "next_step": "Try the matching WebSocket command, REST endpoint, service/entity path, or Supervisor path before giving up.",
+        }
+    if "unknown command" in lowered or "unknown_command" in lowered:
+        return {
+            "category": "unsupported_websocket_command",
+            "meaning": "This Home Assistant version rejected that WebSocket command.",
+            "next_step": "Try a REST endpoint, service/entity path, or version-specific command variant.",
+        }
+    if "cannot connect" in lowered or "connection" in lowered or "timeout" in lowered:
+        return {
+            "category": "connectivity",
+            "meaning": "Hermes could not reach Home Assistant or the Supervisor API reliably.",
+            "next_step": "Check HASS_URL, SUPERVISOR_URL, add-on networking, and whether Home Assistant is still restarting.",
+        }
+    return {
+        "category": "api_error",
+        "meaning": "The API returned an unexpected error.",
+        "next_step": "Keep the exact error and try the next available adapter path before asking the user for manual work.",
+    }
+
+
+def _probe_summary(value: Any) -> Dict[str, Any]:
+    """Return a compact, non-secret summary for diagnostic probe output."""
+    if isinstance(value, list):
+        sample = value[:3]
+        return {"type": "list", "count": len(value), "sample": sample}
+    if isinstance(value, dict):
+        summary: Dict[str, Any] = {"type": "object", "keys": sorted(str(key) for key in value.keys())[:20]}
+        if "count" in value:
+            summary["count"] = value.get("count")
+        if "available_count" in value:
+            summary["available_count"] = value.get("available_count")
+        if "status" in value:
+            summary["status"] = value.get("status")
+        return summary
+    return {"type": type(value).__name__, "value": str(value)[:200]}
+
+
+async def _run_admin_probe(name: str, category: str, call) -> Dict[str, Any]:
+    """Run one admin diagnostic probe and return a classified result."""
+    try:
+        result = await call()
+        return {
+            "name": name,
+            "category": category,
+            "ok": True,
+            "summary": _probe_summary(result),
+        }
+    except Exception as error:
+        return {
+            "name": name,
+            "category": category,
+            "ok": False,
+            "error": str(error),
+            "classification": _classify_admin_error(error),
+        }
+
+
+async def _async_admin_diagnose(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Diagnose Home Assistant admin API capabilities and fallback paths."""
+    if action not in {"run", "quick"}:
+        raise ValueError("Unsupported admin diagnose action")
+
+    hass_url, hass_token = _get_config()
+    supervisor_url, supervisor_token = _get_supervisor_config()
+    checks = {
+        "hass_url": hass_url,
+        "hass_token_present": bool(hass_token),
+        "supervisor_url": supervisor_url,
+        "supervisor_token_present": bool(supervisor_token),
+        "hassio_api_expected": supervisor_url == "http://supervisor" or bool(os.getenv("SUPERVISOR_URL")),
+    }
+
+    probes = [
+        ("ha_rest_config", "homeassistant_rest", lambda: _ha_request("GET", "/api/config")),
+        ("supervisor_info", "supervisor", lambda: _supervisor_request("GET", "/info")),
+        ("supervisor_backups_list", "supervisor", lambda: _supervisor_request("GET", "/backups")),
+        ("automation_ws_list", "automation", lambda: _ws_command({"type": "automation/config/list"})),
+        ("automation_rest_list", "automation", lambda: _ha_request("GET", "/api/config/automation/config")),
+        ("dashboard_ws_list", "dashboard", lambda: _ws_command({"type": "lovelace/dashboards/list"})),
+        ("dashboard_rest_metadata_list", "dashboard", lambda: _ha_request("GET", "/api/lovelace/dashboards")),
+        ("integration_entries", "integration", lambda: _ws_command({"type": "config_entries/get"})),
+        ("repairs_list", "integration", lambda: _ws_command({"type": "repairs/list_issues"})),
+        ("update_entities", "updates", _async_list_update_entities),
+        ("update_services", "updates", lambda: _async_list_services("update")),
+    ]
+    if action == "quick":
+        probes = probes[:6]
+
+    results = [await _run_admin_probe(name, category, call) for name, category, call in probes]
+    categories: Dict[str, Dict[str, int]] = {}
+    for result in results:
+        category = result["category"]
+        category_summary = categories.setdefault(category, {"ok": 0, "failed": 0})
+        if result.get("ok"):
+            category_summary["ok"] += 1
+        else:
+            category_summary["failed"] += 1
+
+    recommendations = []
+    failed_categories = {result.get("classification", {}).get("category") for result in results if not result.get("ok")}
+    if "permission" in failed_categories:
+        recommendations.append("A 403 means Hermes reached the API but lacks permission; update/restart the add-on and verify hassio_api/hassio_role or token scope.")
+    if "missing_endpoint" in failed_categories or "unsupported_websocket_command" in failed_categories:
+        recommendations.append("A 404 or unknown WebSocket command is an adapter-path problem; try the alternate WebSocket, REST, service/entity, or Supervisor path before asking for manual UI work.")
+    if not recommendations:
+        recommendations.append("Use the successful probes as the preferred admin adapter paths for this Home Assistant instance.")
+
+    return {
+        "success": True,
+        "action": action,
+        "checks": checks,
+        "categories": categories,
+        "probes": results,
+        "recommendations": recommendations,
+    }
 
 
 async def _async_list_update_entities() -> list[Dict[str, Any]]:
@@ -1839,6 +1972,17 @@ def _handle_update_manage(args: dict, **kw) -> str:
         return tool_error(f"Failed to manage Home Assistant updates: {e}")
 
 
+def _handle_admin_diagnose(args: dict, **kw) -> str:
+    """Handler for ha_admin_diagnose tool."""
+    action = args.get("action", "run")
+    try:
+        result = _run_async(_async_admin_diagnose(action, args))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_admin_diagnose error: %s", e)
+        return tool_error(f"Failed to diagnose Home Assistant admin capabilities: {e}")
+
+
 def _handle_dashboard_manage(args: dict, **kw) -> str:
     """Handler for ha_dashboard_manage tool."""
     action = args.get("action", "")
@@ -2061,6 +2205,27 @@ HA_UPDATE_MANAGE_SCHEMA = {
             "update_entities": {"type": "boolean", "description": "Include update.* entities such as HACS in update_everything. Default true."},
         },
         "required": ["action"],
+    },
+}
+
+HA_ADMIN_DIAGNOSE_SCHEMA = {
+    "name": "ha_admin_diagnose",
+    "description": (
+        "Read-only diagnostic tool for Home Assistant admin capabilities. Probes critical REST, WebSocket, "
+        "Supervisor, dashboard, automation, integration, and update paths and classifies failures such as "
+        "403 permissions, 404 missing endpoints, and unsupported WebSocket commands. Use after admin tool failures "
+        "before telling the user manual UI work is required."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["run", "quick"],
+                "description": "Run the full read-only probe set or a shorter critical-path probe set. Default run.",
+            },
+        },
+        "required": [],
     },
 }
 
@@ -2420,6 +2585,15 @@ registry.register(
     toolset="homeassistant",
     schema=HA_UPDATE_MANAGE_SCHEMA,
     handler=_handle_update_manage,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_admin_diagnose",
+    toolset="homeassistant",
+    schema=HA_ADMIN_DIAGNOSE_SCHEMA,
+    handler=_handle_admin_diagnose,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
