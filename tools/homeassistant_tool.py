@@ -15,6 +15,9 @@ Registers LLM-callable tools:
 - ``ha_supervisor_manage`` -- manage HA Supervisor, add-ons, updates, logs, and backups
 - ``ha_update_manage`` -- inspect and install Home Assistant update entities, including HACS updates
 - ``ha_admin_diagnose`` -- diagnose HA admin API capabilities and likely fallback paths
+- ``ha_config_read`` -- read Home Assistant Core config files from the mounted config directory
+- ``ha_config_write`` -- write Home Assistant Core config files with backups and path safety checks
+- ``ha_config_reload`` -- reload Home Assistant Core config through the Home Assistant service API
 - ``ha_integration_manage`` -- inspect integrations, repairs, and reload config entries
 - ``ha_entity_rename`` -- rename an entity and optionally set its icon
 - ``ha_zigbee_manage`` -- manage Zigbee2MQTT devices over MQTT
@@ -122,6 +125,11 @@ def _get_hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")))
 
 
+def _get_ha_config_dir() -> Path:
+    """Return the mounted Home Assistant Core config directory."""
+    return Path(os.getenv("HA_CONFIG_DIR") or os.getenv("HOMEASSISTANT_CONFIG_DIR") or "/homeassistant_config")
+
+
 def _backup_json(category: str, name: str, payload: Any) -> str:
     """Write a JSON backup below HERMES_HOME and return the path."""
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name).strip("_") or "backup"
@@ -131,6 +139,60 @@ def _backup_json(category: str, name: str, payload: Any) -> str:
     backup_path = backup_dir / f"{safe_name}-{timestamp}.json"
     backup_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return str(backup_path)
+
+
+def _backup_text(category: str, name: str, content: str) -> str:
+    """Write a text backup below HERMES_HOME and return the path."""
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name).strip("_") or "backup"
+    backup_dir = _get_hermes_home() / f"{category}-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"{safe_name}-{timestamp}"
+    backup_path.write_text(content, encoding="utf-8")
+    return str(backup_path)
+
+
+def _resolve_ha_config_path(path_value: str) -> tuple[Path, str]:
+    """Resolve a user path safely below the mounted Home Assistant config root."""
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        raise ValueError("Missing config path")
+
+    config_dir = _get_ha_config_dir().resolve(strict=False)
+    normalized = raw_path.replace("\\", "/")
+    for prefix in ("/config/", "/homeassistant_config/"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    if normalized in {"/config", "/homeassistant_config"}:
+        normalized = ""
+    if normalized.startswith("/"):
+        raise ValueError("Config path must be relative to /config")
+
+    relative = Path(normalized)
+    if not relative.parts:
+        raise ValueError("Config path must point to a file")
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("Config path must not contain empty, current, or parent-directory segments")
+
+    target = (config_dir / relative).resolve(strict=False)
+    try:
+        target.relative_to(config_dir)
+    except ValueError as e:
+        raise ValueError("Config path escapes the Home Assistant config directory") from e
+    return target, relative.as_posix()
+
+
+def _validate_yaml_if_needed(path: str, content: str) -> Dict[str, Any]:
+    """Validate YAML files when PyYAML is available."""
+    if not path.lower().endswith((".yaml", ".yml")):
+        return {"checked": False, "reason": "not_yaml"}
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return {"checked": False, "reason": "pyyaml_unavailable"}
+    yaml.safe_load(content or "")
+    return {"checked": True, "valid": True}
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +917,8 @@ async def _async_admin_diagnose(action: str, args: Dict[str, Any]) -> Dict[str, 
         "hass_token_present": bool(hass_token),
         "supervisor_url": supervisor_url,
         "supervisor_token_present": bool(supervisor_token),
+        "ha_config_dir": str(_get_ha_config_dir()),
+        "ha_config_dir_exists": _get_ha_config_dir().exists(),
         "hassio_api_expected": supervisor_url == "http://supervisor" or bool(os.getenv("SUPERVISOR_URL")),
     }
 
@@ -866,6 +930,7 @@ async def _async_admin_diagnose(action: str, args: Dict[str, Any]) -> Dict[str, 
         ("automation_rest_list", "automation", lambda: _ha_request("GET", "/api/config/automation/config")),
         ("dashboard_ws_list", "dashboard", lambda: _ws_command({"type": "lovelace/dashboards/list"})),
         ("dashboard_rest_metadata_list", "dashboard", lambda: _ha_request("GET", "/api/lovelace/dashboards")),
+        ("config_filesystem_configuration", "config_filesystem", lambda: _async_config_read("configuration.yaml", max_bytes=256_000)),
         ("integration_entries", "integration", lambda: _ws_command({"type": "config_entries/get"})),
         ("repairs_list", "integration", lambda: _ws_command({"type": "repairs/list_issues"})),
         ("update_entities", "updates", _async_list_update_entities),
@@ -1084,6 +1149,75 @@ async def _async_update_manage(action: str, args: Dict[str, Any]) -> Dict[str, A
         }
 
     raise ValueError(f"Unsupported update action: {action}")
+
+
+async def _async_config_read(path: str, max_bytes: int = 512_000) -> Dict[str, Any]:
+    """Read a Home Assistant Core config file from the mounted config directory."""
+    target, relative_path = _resolve_ha_config_path(path)
+    config_dir = _get_ha_config_dir().resolve(strict=False)
+    if not config_dir.exists():
+        raise FileNotFoundError(f"Home Assistant config mount not found: {config_dir}")
+    if not target.exists() or not target.is_file():
+        raise FileNotFoundError(f"Config file not found: /config/{relative_path}")
+    size = target.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"Config file /config/{relative_path} is {size} bytes; increase max_bytes to read it")
+    content = target.read_text(encoding="utf-8")
+    return {
+        "success": True,
+        "path": f"/config/{relative_path}",
+        "mount_path": str(target),
+        "size": size,
+        "content": content,
+    }
+
+
+async def _async_config_write(path: str, content: str, backup: bool = True, validate_yaml: bool = True, create_parent_dirs: bool = False) -> Dict[str, Any]:
+    """Write a Home Assistant Core config file with path safety and backups."""
+    if not isinstance(content, str):
+        raise ValueError("Config content must be a string")
+    target, relative_path = _resolve_ha_config_path(path)
+    config_dir = _get_ha_config_dir().resolve(strict=False)
+    if not config_dir.exists():
+        raise FileNotFoundError(f"Home Assistant config mount not found: {config_dir}")
+    if target.exists() and not target.is_file():
+        raise ValueError(f"Config path is not a file: /config/{relative_path}")
+    if not target.parent.exists():
+        if create_parent_dirs:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            raise FileNotFoundError(f"Parent directory does not exist for /config/{relative_path}")
+
+    validation = _validate_yaml_if_needed(relative_path, content) if validate_yaml else {"checked": False, "reason": "disabled"}
+    backup_path = None
+    if backup:
+        if target.exists():
+            backup_path = _backup_text("config", relative_path, target.read_text(encoding="utf-8"))
+        else:
+            backup_path = _backup_json("config", f"{relative_path}.create", {"path": f"/config/{relative_path}", "existed": False})
+
+    temp_path = target.with_name(f".{target.name}.hermes-tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    if target.exists():
+        try:
+            temp_path.chmod(target.stat().st_mode & 0o777)
+        except OSError:
+            pass
+    os.replace(temp_path, target)
+    return {
+        "success": True,
+        "path": f"/config/{relative_path}",
+        "mount_path": str(target),
+        "backup_path": backup_path,
+        "validation": validation,
+        "bytes_written": len(content.encode("utf-8")),
+    }
+
+
+async def _async_config_reload() -> Dict[str, Any]:
+    """Reload Home Assistant Core config through the Home Assistant service API."""
+    result = await _async_call_service("homeassistant", "reload_core_config")
+    return {"success": True, "service": "homeassistant.reload_core_config", "result": result}
 
 
 async def _async_dashboard_manage(action: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1983,6 +2117,43 @@ def _handle_admin_diagnose(args: dict, **kw) -> str:
         return tool_error(f"Failed to diagnose Home Assistant admin capabilities: {e}")
 
 
+def _handle_config_read(args: dict, **kw) -> str:
+    """Handler for ha_config_read tool."""
+    try:
+        max_bytes = int(args.get("max_bytes", 512_000))
+        result = _run_async(_async_config_read(str(args.get("path") or ""), max_bytes=max_bytes))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_config_read error: %s", e)
+        return tool_error(f"Failed to read Home Assistant config file: {e}")
+
+
+def _handle_config_write(args: dict, **kw) -> str:
+    """Handler for ha_config_write tool."""
+    try:
+        result = _run_async(_async_config_write(
+            str(args.get("path") or ""),
+            args.get("content"),
+            backup=bool(args.get("backup", True)),
+            validate_yaml=bool(args.get("validate_yaml", True)),
+            create_parent_dirs=bool(args.get("create_parent_dirs", False)),
+        ))
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_config_write error: %s", e)
+        return tool_error(f"Failed to write Home Assistant config file: {e}")
+
+
+def _handle_config_reload(args: dict, **kw) -> str:
+    """Handler for ha_config_reload tool."""
+    try:
+        result = _run_async(_async_config_reload())
+        return json.dumps({"result": result})
+    except Exception as e:
+        logger.error("ha_config_reload error: %s", e)
+        return tool_error(f"Failed to reload Home Assistant core config: {e}")
+
+
 def _handle_dashboard_manage(args: dict, **kw) -> str:
     """Handler for ha_dashboard_manage tool."""
     action = args.get("action", "")
@@ -2225,6 +2396,45 @@ HA_ADMIN_DIAGNOSE_SCHEMA = {
                 "description": "Run the full read-only probe set or a shorter critical-path probe set. Default run.",
             },
         },
+        "required": [],
+    },
+}
+
+HA_CONFIG_READ_SCHEMA = {
+    "name": "ha_config_read",
+    "description": "Read a Home Assistant Core config file from the mounted /config directory, such as configuration.yaml, scripts.yaml, scenes.yaml, or templates.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Relative path below /config, or /config/... for user-facing paths."},
+            "max_bytes": {"type": "integer", "description": "Maximum file size to return. Default 512000."},
+        },
+        "required": ["path"],
+    },
+}
+
+HA_CONFIG_WRITE_SCHEMA = {
+    "name": "ha_config_write",
+    "description": "Write a Home Assistant Core config file below /config with sandboxed paths, backup before write, and optional YAML validation. Ask for confirmation before use.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Relative path below /config, or /config/... for user-facing paths."},
+            "content": {"type": "string", "description": "Full new file content to write."},
+            "backup": {"type": "boolean", "description": "Create a backup before writing. Default true."},
+            "validate_yaml": {"type": "boolean", "description": "Validate .yaml/.yml syntax when PyYAML is available. Default true."},
+            "create_parent_dirs": {"type": "boolean", "description": "Create missing parent directories. Default false."},
+        },
+        "required": ["path", "content"],
+    },
+}
+
+HA_CONFIG_RELOAD_SCHEMA = {
+    "name": "ha_config_reload",
+    "description": "Reload Home Assistant Core config by calling homeassistant.reload_core_config. Ask for confirmation before use after writes.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
         "required": [],
     },
 }
@@ -2594,6 +2804,33 @@ registry.register(
     toolset="homeassistant",
     schema=HA_ADMIN_DIAGNOSE_SCHEMA,
     handler=_handle_admin_diagnose,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_config_read",
+    toolset="homeassistant",
+    schema=HA_CONFIG_READ_SCHEMA,
+    handler=_handle_config_read,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_config_write",
+    toolset="homeassistant",
+    schema=HA_CONFIG_WRITE_SCHEMA,
+    handler=_handle_config_write,
+    check_fn=_check_ha_available,
+    emoji="🏠",
+)
+
+registry.register(
+    name="ha_config_reload",
+    toolset="homeassistant",
+    schema=HA_CONFIG_RELOAD_SCHEMA,
+    handler=_handle_config_reload,
     check_fn=_check_ha_available,
     emoji="🏠",
 )
