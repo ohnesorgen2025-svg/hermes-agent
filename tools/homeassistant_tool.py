@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -87,6 +88,240 @@ _BLOCKED_DOMAINS = frozenset({
     "hassio",           # addon control, host shutdown/reboot, stdin to containers
     "rest_command",     # HTTP requests from HA server (SSRF vector)
 })
+
+_HA_APPROVAL_SUPERVISOR_ACTIONS = frozenset({
+    "uninstall", "restart", "stop",
+    "uninstall_addon", "restart_addon", "stop_addon",
+})
+_HA_APPROVAL_INTEGRATION_ACTIONS = frozenset({"remove_entry", "remove", "delete"})
+_HA_APPROVAL_ZIGBEE_ACTIONS = frozenset({"remove_device", "remove"})
+
+
+def _format_ha_approval_target(target: Any) -> str:
+    """Return a compact target string for approval prompts."""
+    if target is None:
+        return "unspecified"
+    if isinstance(target, str):
+        return target.strip() or "unspecified"
+    try:
+        rendered = json.dumps(target, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        rendered = str(target)
+    return rendered[:500] or "unspecified"
+
+
+def _ha_approval_command(tool_name: str, action: str, target: Any) -> str:
+    """Build the command-like text shown in approval UIs."""
+    return (
+        f"{tool_name} action={action or 'unspecified'} "
+        f"target={_format_ha_approval_target(target)}"
+    )
+
+
+def _check_ha_tool_approval(
+    tool_name: str,
+    action: str,
+    target: Any,
+    risk_description: str,
+) -> Optional[str]:
+    """Require approval for destructive Home Assistant tool actions.
+
+    Mirrors the terminal approval flow for manual, smart, gateway, CLI, yolo,
+    and approvals.mode=off behavior without changing tools.approval.
+    """
+    from tools.approval import (  # imported lazily to keep module import light
+        _ApprovalEntry,
+        _fire_approval_hook,
+        _gateway_notify_cbs,
+        _gateway_queues,
+        _get_approval_config,
+        _get_approval_mode,
+        _is_gateway_approval_context,
+        _lock,
+        _permanent_approved,
+        _smart_approve,
+        approve_permanent,
+        approve_session,
+        get_current_session_key,
+        is_approved,
+        is_current_session_yolo_enabled,
+        prompt_dangerous_approval,
+        save_permanent_allowlist,
+        submit_pending,
+    )
+    from tools.terminal_tool import _get_approval_callback
+    from utils import is_truthy_value
+
+    command = _ha_approval_command(tool_name, action, target)
+    pattern_key = f"ha_tool:{tool_name}:{action or 'unspecified'}"
+    description = (
+        f"Home Assistant approval required: tool={tool_name}, "
+        f"action={action or 'unspecified'}, "
+        f"target={_format_ha_approval_target(target)}. {risk_description}"
+    )
+
+    approval_mode = _get_approval_mode()
+    if (
+        is_truthy_value(os.getenv("HERMES_YOLO_MODE"))
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
+        return None
+
+    session_key = get_current_session_key()
+    if is_approved(session_key, pattern_key):
+        return None
+
+    is_cli = os.getenv("HERMES_INTERACTIVE")
+    is_gateway = _is_gateway_approval_context()
+    is_ask = os.getenv("HERMES_EXEC_ASK")
+    if not is_cli and not is_gateway and not is_ask:
+        return None
+
+    if approval_mode == "smart":
+        verdict = _smart_approve(command, description)
+        if verdict == "approve":
+            approve_session(session_key, pattern_key)
+            logger.debug("Smart approval: auto-approved HA action '%s'", command)
+            return None
+        if verdict == "deny":
+            return (
+                f"BLOCKED by smart approval: {description}. "
+                "The Home Assistant action was assessed as genuinely dangerous. Do NOT retry."
+            )
+
+    if is_gateway or is_ask:
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        approval_data = {
+            "command": command,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "description": description,
+        }
+
+        if notify_cb is None:
+            submit_pending(session_key, approval_data)
+            return (
+                f"Approval required for Home Assistant action. Tool: {tool_name}; "
+                f"action: {action}; target: {_format_ha_approval_target(target)}."
+            )
+
+        entry = _ApprovalEntry(approval_data)
+        with _lock:
+            _gateway_queues.setdefault(session_key, []).append(entry)
+
+        _fire_approval_hook(
+            "pre_approval_request",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="gateway",
+        )
+
+        try:
+            notify_cb(approval_data)
+        except Exception as exc:
+            logger.warning("Gateway HA approval notify failed: %s", exc)
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+            return "BLOCKED: Failed to send Home Assistant approval request to user. Do NOT retry."
+
+        try:
+            timeout = int(_get_approval_config().get("gateway_timeout", 300))
+        except (TypeError, ValueError):
+            timeout = 300
+
+        try:
+            from tools.environments.base import touch_activity_if_due
+        except Exception:  # pragma: no cover
+            touch_activity_if_due = None
+
+        now = time.monotonic()
+        deadline = now + max(timeout, 0)
+        activity_state = {"last_touch": now, "start": now}
+        resolved = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if entry.event.wait(timeout=min(1.0, remaining)):
+                resolved = True
+                break
+            if touch_activity_if_due is not None:
+                touch_activity_if_due(activity_state, "waiting for Home Assistant approval")
+
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+
+        choice = entry.result
+        outcome = "timeout" if not resolved else (choice if choice else "timeout")
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="gateway",
+            choice=outcome,
+        )
+
+        if not resolved or choice is None or choice == "deny":
+            reason = "timed out" if not resolved else "denied by user"
+            return f"BLOCKED: Home Assistant action {reason}. Do NOT retry this action."
+
+        if choice in {"session", "always"}:
+            approve_session(session_key, pattern_key)
+        if choice == "always":
+            approve_permanent(pattern_key)
+            save_permanent_allowlist(_permanent_approved)
+        return None
+
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+    )
+    choice = prompt_dangerous_approval(
+        command,
+        description,
+        approval_callback=_get_approval_callback(),
+    )
+    _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
+    )
+
+    if choice == "deny":
+        return "BLOCKED: User denied this Home Assistant action. Do NOT retry."
+    if choice in {"session", "always"}:
+        approve_session(session_key, pattern_key)
+    if choice == "always":
+        approve_permanent(pattern_key)
+        save_permanent_allowlist(_permanent_approved)
+    return None
 
 
 def _get_headers(token: str = "") -> Dict[str, str]:
@@ -1923,6 +2158,20 @@ def _handle_entity_rename(args: dict, **kw) -> str:
     if name is None and icon is None and new_entity_id is None and area_id is None:
         return tool_error("At least one of name, icon, new_entity_id, or area_id is required")
 
+    approval_error = _check_ha_tool_approval(
+        "ha_entity_rename",
+        "update_registry",
+        {
+            "entity_id": entity_id,
+            "new_entity_id": new_entity_id,
+            "name": name,
+            "area_id": area_id,
+        },
+        "This changes the Home Assistant entity registry.",
+    )
+    if approval_error:
+        return tool_error(approval_error)
+
     try:
         result = _run_async(
             _async_entity_rename(
@@ -2042,6 +2291,16 @@ def _handle_automation_manage(args: dict, **kw) -> str:
             parsed_config = _parse_automation_config(config)
             if not automation_id and action == "create":
                 automation_id = _slugify_automation_id(str(parsed_config["alias"]))
+        if action == "delete":
+            normalized_id = _normalize_automation_id(str(automation_id or ""))
+            approval_error = _check_ha_tool_approval(
+                "ha_automation_manage",
+                action,
+                normalized_id,
+                "This deletes a Home Assistant automation configuration.",
+            )
+            if approval_error:
+                return tool_error(approval_error)
         result = _run_async(_async_automation_manage(action, automation_id, parsed_config))
         return json.dumps({"result": result})
     except Exception as e:
@@ -2076,6 +2335,15 @@ def _handle_matter_manage(args: dict, **kw) -> str:
 def _handle_zigbee_manage(args: dict, **kw) -> str:
     """Handler for ha_zigbee_manage tool."""
     action = args.get("action", "")
+    if action in _HA_APPROVAL_ZIGBEE_ACTIONS:
+        approval_error = _check_ha_tool_approval(
+            "ha_zigbee_manage",
+            action,
+            args.get("ieee_address") or args.get("friendly_name"),
+            "This removes a Zigbee2MQTT device from the network registry.",
+        )
+        if approval_error:
+            return tool_error(approval_error)
     try:
         result = _zigbee_manage(action, args)
         return json.dumps({"result": result})
@@ -2087,6 +2355,15 @@ def _handle_zigbee_manage(args: dict, **kw) -> str:
 def _handle_supervisor_manage(args: dict, **kw) -> str:
     """Handler for ha_supervisor_manage tool."""
     action = args.get("action", "")
+    if action in _HA_APPROVAL_SUPERVISOR_ACTIONS:
+        approval_error = _check_ha_tool_approval(
+            "ha_supervisor_manage",
+            action,
+            args.get("addon") or args.get("slug") or args.get("path"),
+            "This is a destructive or disruptive Supervisor action.",
+        )
+        if approval_error:
+            return tool_error(approval_error)
     try:
         result = _run_async(_async_supervisor_manage(action, args))
         return json.dumps({"result": result})
@@ -2130,10 +2407,28 @@ def _handle_config_read(args: dict, **kw) -> str:
 
 def _handle_config_write(args: dict, **kw) -> str:
     """Handler for ha_config_write tool."""
+    path_value = str(args.get("path") or "")
+    content = args.get("content")
+    if not isinstance(content, str):
+        return tool_error("Config content must be a string")
+    try:
+        _, relative_path = _resolve_ha_config_path(path_value)
+    except Exception as e:
+        return tool_error(str(e))
+
+    approval_error = _check_ha_tool_approval(
+        "ha_config_write",
+        "write",
+        f"/config/{relative_path}",
+        "This writes a Home Assistant Core config file.",
+    )
+    if approval_error:
+        return tool_error(approval_error)
+
     try:
         result = _run_async(_async_config_write(
-            str(args.get("path") or ""),
-            args.get("content"),
+            path_value,
+            content,
             backup=bool(args.get("backup", True)),
             validate_yaml=bool(args.get("validate_yaml", True)),
             create_parent_dirs=bool(args.get("create_parent_dirs", False)),
@@ -2168,6 +2463,15 @@ def _handle_dashboard_manage(args: dict, **kw) -> str:
 def _handle_integration_manage(args: dict, **kw) -> str:
     """Handler for ha_integration_manage tool."""
     action = args.get("action", "")
+    if action in _HA_APPROVAL_INTEGRATION_ACTIONS:
+        approval_error = _check_ha_tool_approval(
+            "ha_integration_manage",
+            action,
+            args.get("entry_id") or args.get("domain") or args.get("issue_id"),
+            "This removes a Home Assistant integration/config entry.",
+        )
+        if approval_error:
+            return tool_error(approval_error)
     try:
         result = _run_async(_async_integration_manage(action, args))
         return json.dumps({"result": result})

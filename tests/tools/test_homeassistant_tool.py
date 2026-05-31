@@ -17,6 +17,13 @@ from tools.homeassistant_tool import (
     _get_headers,
     _handle_get_state,
     _handle_call_service,
+    _handle_automation_manage,
+    _handle_config_read,
+    _handle_config_write,
+    _handle_entity_rename,
+    _handle_integration_manage,
+    _handle_supervisor_manage,
+    _handle_zigbee_manage,
     _BLOCKED_DOMAINS,
     _ENTITY_ID_RE,
     _SERVICE_NAME_RE,
@@ -250,6 +257,101 @@ class TestDomainBlocklist:
 
     def test_blocked_domains_include_rest_command(self):
         assert "rest_command" in _BLOCKED_DOMAINS
+
+
+# ---------------------------------------------------------------------------
+# Approval gating for destructive Home Assistant admin actions
+# ---------------------------------------------------------------------------
+
+
+class TestHomeAssistantApprovalGating:
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_config_write_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_config_write({"path": "configuration.yaml", "content": "homeassistant:\n"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[0] == "ha_config_write"
+        assert mock_approval.call_args.args[1] == "write"
+        assert mock_approval.call_args.args[2] == "/config/configuration.yaml"
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_entity_rename_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_entity_rename({"entity_id": "light.kitchen", "name": "Kitchen"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[0] == "ha_entity_rename"
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_automation_delete_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_automation_manage({"action": "delete", "automation_id": "automation.test"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_automation_manage", "delete", "test")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_integration_remove_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_integration_manage({"action": "remove_entry", "entry_id": "abc123"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_integration_manage", "remove_entry", "abc123")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_supervisor_stop_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_supervisor_manage({"action": "stop_addon", "addon": "core_mosquitto"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_supervisor_manage", "stop_addon", "core_mosquitto")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    def test_zigbee_remove_requires_approval(self, mock_approval):
+        result = json.loads(_handle_zigbee_manage({"action": "remove_device", "ieee_address": "0x00124b0024c00000"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == (
+            "ha_zigbee_manage",
+            "remove_device",
+            "0x00124b0024c00000",
+        )
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_read_only_actions_do_not_request_approval(self, mock_run, mock_approval):
+        def fake_run_async(coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return {"success": True}
+
+        mock_run.side_effect = fake_run_async
+
+        assert "error" not in json.loads(_handle_config_read({"path": "configuration.yaml"}))
+        assert "error" not in json.loads(_handle_automation_manage({"action": "list"}))
+        assert "error" not in json.loads(_handle_integration_manage({"action": "list_entries"}))
+        assert "error" not in json.loads(_handle_supervisor_manage({"action": "list_addons"}))
+
+        mock_approval.assert_not_called()
+        assert mock_run.call_count == 4
 
 
 # ---------------------------------------------------------------------------
