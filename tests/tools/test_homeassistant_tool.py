@@ -4,6 +4,7 @@ Tests real logic: entity filtering, payload building, response parsing,
 handler validation, and availability gating.
 """
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from tools.homeassistant_tool import (
     _get_headers,
     _handle_get_state,
     _handle_call_service,
+    _async_automation_manage,
     _handle_automation_manage,
     _handle_config_read,
     _handle_config_write,
@@ -302,6 +304,21 @@ class TestHomeAssistantApprovalGating:
 
     @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
     @patch("tools.homeassistant_tool._run_async")
+    def test_automation_update_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_automation_manage({
+            "action": "update",
+            "automation_id": "automation.test",
+            "config": {"alias": "Test", "trigger": [], "action": []},
+        }))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_automation_manage", "update", "test")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
     def test_integration_remove_requires_approval(self, mock_run, mock_approval):
         result = json.loads(_handle_integration_manage({"action": "remove_entry", "entry_id": "abc123"}))
 
@@ -352,6 +369,61 @@ class TestHomeAssistantApprovalGating:
 
         mock_approval.assert_not_called()
         assert mock_run.call_count == 4
+
+
+# ---------------------------------------------------------------------------
+# Automation WebSocket compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestAutomationWebSocketCompatibility:
+    def test_get_uses_automation_config_with_entity_id(self, monkeypatch):
+        calls = []
+
+        async def fake_ws_command(message):
+            calls.append(message)
+            return {"config": {"alias": "Dimmer links", "trigger": [], "action": []}}
+
+        monkeypatch.setattr("tools.homeassistant_tool._ws_command", fake_ws_command)
+
+        result = asyncio.run(_async_automation_manage("get", "automation.dimmer_links"))
+
+        assert result["source"] == "websocket"
+        assert result["entity_id"] == "automation.dimmer_links"
+        assert result["automation"]["alias"] == "Dimmer links"
+        assert calls == [{"type": "automation/config", "entity_id": "automation.dimmer_links"}]
+
+    def test_list_falls_back_to_states_and_entity_configs(self, monkeypatch):
+        calls = []
+
+        async def fake_ws_command(message):
+            calls.append(message)
+            if message["type"] == "automation/config/list":
+                raise RuntimeError("Unknown command")
+            return {"config": {"alias": message["entity_id"], "trigger": [], "action": []}}
+
+        async def fake_ha_request(method, path, data=None):
+            assert method == "GET"
+            assert path == "/api/states"
+            return {
+                "response": [
+                    {"entity_id": "automation.dimmer_links", "state": "on", "attributes": {"friendly_name": "Dimmer links"}},
+                    {"entity_id": "light.buero", "state": "off", "attributes": {}},
+                ]
+            }
+
+        monkeypatch.setattr("tools.homeassistant_tool._ws_command", fake_ws_command)
+        monkeypatch.setattr("tools.homeassistant_tool._ha_request", fake_ha_request)
+
+        result = asyncio.run(_async_automation_manage("list"))
+
+        assert result["source"] == "websocket_entity_configs"
+        assert result["count"] == 1
+        assert result["automations"][0]["entity_id"] == "automation.dimmer_links"
+        assert calls == [
+            {"type": "automation/config/list"},
+            {"type": "automation/config", "entity_id": "automation.dimmer_links"},
+        ]
 
 
 # ---------------------------------------------------------------------------

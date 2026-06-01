@@ -1706,6 +1706,34 @@ def _normalize_automation_id(automation_id: str) -> str:
     return automation_id.split(".", 1)[1] if automation_id.startswith("automation.") else automation_id
 
 
+def _automation_entity_id(automation_id: str) -> str:
+    """Return an automation entity_id from a config ID or entity-style ID."""
+    normalized_id = _normalize_automation_id(automation_id)
+    return f"automation.{normalized_id}"
+
+
+async def _list_automation_states() -> list[Dict[str, Any]]:
+    """Return Home Assistant automation states from the generic states API."""
+    result = await _ha_request("GET", "/api/states")
+    states = result.get("response", [])
+    if not isinstance(states, list):
+        return []
+    return [
+        state for state in states
+        if isinstance(state, dict) and str(state.get("entity_id", "")).startswith("automation.")
+    ]
+
+
+async def _get_automation_config_by_entity_id(entity_id: str) -> Dict[str, Any]:
+    """Read a full automation config through the HA WebSocket command that requires entity_id."""
+    result = await _ws_command({"type": "automation/config", "entity_id": entity_id})
+    if isinstance(result, dict) and isinstance(result.get("config"), dict):
+        return result["config"]
+    if isinstance(result, dict):
+        return result
+    raise RuntimeError(f"Unexpected automation/config response for {entity_id}: {result!r}")
+
+
 def _parse_automation_config(config: Any) -> Dict[str, Any]:
     """Parse and validate an automation config payload."""
     if isinstance(config, str):
@@ -1837,25 +1865,57 @@ async def _async_automation_manage(
 
     try:
         if action == "list":
-            result = await _ws_command({"type": "automation/config/list"})
-            return {"success": True, "action": action, "source": "websocket", "automations": result, "count": len(result) if isinstance(result, list) else None}
+            try:
+                result = await _ws_command({"type": "automation/config/list"})
+                return {"success": True, "action": action, "source": "websocket", "automations": result, "count": len(result) if isinstance(result, list) else None}
+            except Exception as list_error:
+                logger.info("Automation WebSocket list command unavailable; listing automation states: %s", list_error)
+
+            automation_states = await _list_automation_states()
+            automations = []
+            for automation_state in automation_states:
+                entity_id = str(automation_state.get("entity_id", ""))
+                try:
+                    automation_config = await _get_automation_config_by_entity_id(entity_id)
+                    automations.append({
+                        "entity_id": entity_id,
+                        "automation_id": entity_id.split(".", 1)[1],
+                        "state": automation_state.get("state"),
+                        "attributes": automation_state.get("attributes", {}),
+                        "config": automation_config,
+                    })
+                except Exception as config_error:
+                    automations.append({
+                        "entity_id": entity_id,
+                        "automation_id": entity_id.split(".", 1)[1],
+                        "state": automation_state.get("state"),
+                        "attributes": automation_state.get("attributes", {}),
+                        "config_error": str(config_error),
+                    })
+            return {"success": True, "action": action, "source": "websocket_entity_configs", "automations": automations, "count": len(automations)}
 
         normalized_id = _normalize_automation_id(automation_id or "")
+        entity_id = _automation_entity_id(normalized_id)
 
         if action == "get":
+            try:
+                result = await _get_automation_config_by_entity_id(entity_id)
+                return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "entity_id": entity_id, "automation": result}
+            except Exception as get_error:
+                logger.info("automation/config by entity_id failed; trying legacy item command: %s", get_error)
             result = await _ws_command({"type": "automation/config/item", "id": normalized_id})
-            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "automation": result}
+            return {"success": True, "action": action, "source": "websocket_legacy", "automation_id": normalized_id, "entity_id": entity_id, "automation": result}
 
         if action in {"create", "update"}:
             if not isinstance(config, dict):
                 raise ValueError("Missing or invalid required parameter: config")
             payload = {"type": "automation/config/save", "id": normalized_id, "config": config}
             result = await _ws_command(payload)
-            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "automation": result, "reloaded": True}
+            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "entity_id": entity_id, "automation": result, "reloaded": True}
 
         if action == "delete":
             result = await _ws_command({"type": "automation/config/delete", "id": normalized_id})
-            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "result": result, "reloaded": True}
+            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "entity_id": entity_id, "result": result, "reloaded": True}
 
     except ValueError:
         raise
@@ -2291,13 +2351,15 @@ def _handle_automation_manage(args: dict, **kw) -> str:
             parsed_config = _parse_automation_config(config)
             if not automation_id and action == "create":
                 automation_id = _slugify_automation_id(str(parsed_config["alias"]))
-        if action == "delete":
-            normalized_id = _normalize_automation_id(str(automation_id or ""))
+        if action in {"create", "update", "delete"}:
+            approval_target = str(automation_id or "")
+            if action in {"update", "delete"}:
+                approval_target = _normalize_automation_id(approval_target)
             approval_error = _check_ha_tool_approval(
                 "ha_automation_manage",
                 action,
-                normalized_id,
-                "This deletes a Home Assistant automation configuration.",
+                approval_target,
+                "This writes a Home Assistant automation configuration.",
             )
             if approval_error:
                 return tool_error(approval_error)
