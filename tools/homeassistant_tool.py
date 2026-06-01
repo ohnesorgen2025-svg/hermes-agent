@@ -1746,6 +1746,18 @@ def _parse_automation_config(config: Any) -> Dict[str, Any]:
 
     config = dict(config)
 
+    for singular_key, plural_key in (("trigger", "triggers"), ("condition", "conditions"), ("action", "actions")):
+        singular_present = singular_key in config and config[singular_key] not in (None, "")
+        plural_present = plural_key in config and config[plural_key] not in (None, "")
+        if singular_present and plural_present and config[singular_key] != config[plural_key]:
+            raise ValueError(
+                f"Automation config may not define both '{singular_key}' and '{plural_key}' with different values"
+            )
+        if not singular_present and plural_present:
+            config[singular_key] = config[plural_key]
+        if plural_key in config:
+            config.pop(plural_key, None)
+
     enabled = config.pop("enabled", None)
     if enabled is not None:
         if not isinstance(enabled, bool):

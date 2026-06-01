@@ -451,6 +451,21 @@ class TestAutomationWebSocketCompatibility:
 
 
 class TestAutomationConfigParsing:
+    def test_plural_keys_map_to_singular(self):
+        parsed = _parse_automation_config({
+            "alias": "Hermes Test Automation",
+            "triggers": [{"platform": "event", "event_type": "hermes_no_op_test"}],
+            "actions": [{"service": "logbook.log", "data": {"message": "Hermes Test"}}],
+            "conditions": [],
+        })
+
+        assert parsed["trigger"] == [{"platform": "event", "event_type": "hermes_no_op_test"}]
+        assert parsed["action"] == [{"service": "logbook.log", "data": {"message": "Hermes Test"}}]
+        assert parsed["condition"] == []
+        assert "triggers" not in parsed
+        assert "actions" not in parsed
+        assert "conditions" not in parsed
+
     def test_enabled_false_maps_to_initial_state_false(self):
         parsed = _parse_automation_config({
             "alias": "Hermes Test Automation",
@@ -469,6 +484,15 @@ class TestAutomationConfigParsing:
                 "trigger": [],
                 "action": [],
                 "enabled": "false",
+            })
+
+    def test_conflicting_singular_and_plural_keys_are_rejected(self):
+        with pytest.raises(ValueError, match="trigger"):
+            _parse_automation_config({
+                "alias": "Hermes Test Automation",
+                "trigger": [],
+                "triggers": [{"platform": "event", "event_type": "hermes_no_op_test"}],
+                "action": [],
             })
 
 
