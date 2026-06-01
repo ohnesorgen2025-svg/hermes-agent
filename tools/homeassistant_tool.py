@@ -1744,6 +1744,14 @@ def _parse_automation_config(config: Any) -> Dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("Missing or invalid required parameter: config")
 
+    config = dict(config)
+
+    enabled = config.pop("enabled", None)
+    if enabled is not None:
+        if not isinstance(enabled, bool):
+            raise ValueError("Automation config field 'enabled' must be a boolean when provided")
+        config.setdefault("initial_state", enabled)
+
     missing = [field for field in ("alias", "trigger", "action") if field not in config or config[field] in (None, "")]
     if missing:
         raise ValueError(f"Automation config missing required field(s): {', '.join(missing)}")
@@ -1817,49 +1825,29 @@ async def _async_automation_manage(
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Manage Home Assistant automations through WebSocket config commands."""
-    import aiohttp
-
-    hass_url, hass_token = _get_config()
+    hass_url, _ = _get_config()
     base_url = f"{hass_url}/api/config/automation/config"
 
     async def rest_fallback() -> Dict[str, Any]:
-        async with aiohttp.ClientSession() as session:
-            if action == "list":
-                async with session.get(base_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    resp.raise_for_status()
-                    result = await resp.json()
-                return {"success": True, "action": action, "source": "rest", "automations": result, "count": len(result) if isinstance(result, list) else None}
+        if action == "list":
+            result = await _ha_request("GET", "/api/config/automation/config")
+            automations = result.get("response")
+            return {"success": True, "action": action, "source": "rest", "automations": automations, "count": len(automations) if isinstance(automations, list) else None}
 
-            normalized_id = _normalize_automation_id(automation_id or "")
-            automation_url = f"{base_url}/{normalized_id}"
+        normalized_id = _normalize_automation_id(automation_id or "")
+        automation_path = f"/api/config/automation/config/{normalized_id}"
 
-            if action == "get":
-                async with session.get(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    resp.raise_for_status()
-                    result = await resp.json()
-                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result}
+        if action == "get":
+            result = await _ha_request("GET", automation_path)
+            return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result.get("response")}
 
-            if action in {"create", "update"}:
-                async with session.post(
-                    automation_url,
-                    headers=_get_headers(hass_token),
-                    json=config,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    resp.raise_for_status()
-                    result = await resp.json()
-                await _async_reload_automations(session, hass_url, hass_token)
-                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result, "reloaded": True}
+        if action in {"create", "update"}:
+            result = await _ha_request("POST", automation_path, data=config)
+            return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "automation": result.get("response"), "reloaded": True}
 
-            if action == "delete":
-                async with session.delete(automation_url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    resp.raise_for_status()
-                    try:
-                        result = await resp.json()
-                    except aiohttp.ContentTypeError:
-                        result = None
-                await _async_reload_automations(session, hass_url, hass_token)
-                return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "result": result, "reloaded": True}
+        if action == "delete":
+            result = await _ha_request("DELETE", automation_path)
+            return {"success": True, "action": action, "source": "rest", "automation_id": normalized_id, "result": result.get("response"), "reloaded": True}
 
         raise ValueError(f"Unsupported action: {action}")
 
@@ -1909,9 +1897,7 @@ async def _async_automation_manage(
         if action in {"create", "update"}:
             if not isinstance(config, dict):
                 raise ValueError("Missing or invalid required parameter: config")
-            payload = {"type": "automation/config/save", "id": normalized_id, "config": config}
-            result = await _ws_command(payload)
-            return {"success": True, "action": action, "source": "websocket", "automation_id": normalized_id, "entity_id": entity_id, "automation": result, "reloaded": True}
+            return await rest_fallback()
 
         if action == "delete":
             result = await _ws_command({"type": "automation/config/delete", "id": normalized_id})

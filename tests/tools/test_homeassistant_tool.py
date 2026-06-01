@@ -12,6 +12,7 @@ import pytest
 
 from tools.homeassistant_tool import (
     _check_ha_available,
+    _parse_automation_config,
     _filter_and_summarize,
     _build_service_payload,
     _parse_service_response,
@@ -424,6 +425,51 @@ class TestAutomationWebSocketCompatibility:
             {"type": "automation/config/list"},
             {"type": "automation/config", "entity_id": "automation.dimmer_links"},
         ]
+
+    def test_create_uses_rest_fallback_without_websocket_save(self, monkeypatch):
+        calls = []
+
+        async def fake_ha_request(method, path, data=None):
+            calls.append((method, path, data))
+            return {"success": True, "status": 200, "response": {"result": "ok"}}
+
+        monkeypatch.setattr("tools.homeassistant_tool._ha_request", fake_ha_request)
+
+        result = asyncio.run(_async_automation_manage(
+            "create",
+            "hermes_test_automation",
+            {"alias": "Hermes Test Automation", "trigger": [], "action": [], "initial_state": False},
+        ))
+
+        assert result["source"] == "rest"
+        assert result["automation_id"] == "hermes_test_automation"
+        assert calls[0] == (
+            "POST",
+            "/api/config/automation/config/hermes_test_automation",
+            {"alias": "Hermes Test Automation", "trigger": [], "action": [], "initial_state": False},
+        )
+
+
+class TestAutomationConfigParsing:
+    def test_enabled_false_maps_to_initial_state_false(self):
+        parsed = _parse_automation_config({
+            "alias": "Hermes Test Automation",
+            "trigger": [],
+            "action": [],
+            "enabled": False,
+        })
+
+        assert parsed["initial_state"] is False
+        assert "enabled" not in parsed
+
+    def test_enabled_must_be_boolean(self):
+        with pytest.raises(ValueError, match="enabled"):
+            _parse_automation_config({
+                "alias": "Hermes Test Automation",
+                "trigger": [],
+                "action": [],
+                "enabled": "false",
+            })
 
 
 # ---------------------------------------------------------------------------
