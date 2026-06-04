@@ -82,6 +82,79 @@ _MEMORY_THREAT_PATTERNS = [
     (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
 ]
 
+_HA_ENTITY_DOMAINS = (
+    "alarm_control_panel",
+    "binary_sensor",
+    "button",
+    "camera",
+    "climate",
+    "cover",
+    "device_tracker",
+    "event",
+    "fan",
+    "humidifier",
+    "image",
+    "input_boolean",
+    "input_button",
+    "input_datetime",
+    "input_number",
+    "input_select",
+    "input_text",
+    "lawn_mower",
+    "light",
+    "lock",
+    "media_player",
+    "number",
+    "person",
+    "remote",
+    "sensor",
+    "sun",
+    "switch",
+    "timer",
+    "update",
+    "vacuum",
+    "valve",
+    "weather",
+)
+
+_HA_SERVICE_OBJECT_IDS = {
+    "disable",
+    "enable",
+    "lock",
+    "pause",
+    "press",
+    "reload",
+    "restart",
+    "start",
+    "stop",
+    "toggle",
+    "turn_off",
+    "turn_on",
+    "unlock",
+    "update",
+}
+
+_HA_SERVICE_OBJECT_PREFIXES = (
+    "alarm_",
+    "close_",
+    "media_",
+    "mute_",
+    "open_",
+    "play_",
+    "select_",
+    "set_",
+    "toggle_",
+    "turn_",
+    "unmute_",
+    "volume_",
+)
+
+_HA_ENTITY_ID_RE = re.compile(
+    r"(?<![a-z0-9_])"
+    rf"(?P<entity>(?:{'|'.join(sorted(_HA_ENTITY_DOMAINS, key=len, reverse=True))})\.(?P<object_id>[a-z0-9_]+))"
+    r"(?![a-z0-9_])"
+)
+
 # Subset of invisible chars for injection detection
 _INVISIBLE_CHARS = {
     '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
@@ -95,6 +168,15 @@ def _scan_memory_content(content: str) -> Optional[str]:
     for char in _INVISIBLE_CHARS:
         if char in content:
             return f"Blocked: content contains invisible unicode character U+{ord(char):04X} (possible injection)."
+
+    # Reject Home Assistant entity IDs; they are derivable from the live system.
+    for match in _HA_ENTITY_ID_RE.finditer(content):
+        object_id = match.group("object_id")
+        if object_id in _HA_SERVICE_OBJECT_IDS:
+            continue
+        if any(object_id.startswith(prefix) for prefix in _HA_SERVICE_OBJECT_PREFIXES):
+            continue
+        return "Entity-IDs sind aus HA ableitbar und gehören nicht in die Memory (Drei-Wege-Test). Schreibe stattdessen einen Skill oder lass es weg."
 
     # Check threat patterns
     for pattern, pid in _MEMORY_THREAT_PATTERNS:
