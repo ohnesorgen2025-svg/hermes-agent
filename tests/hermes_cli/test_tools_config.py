@@ -243,10 +243,13 @@ def test_get_platform_tools_expands_composite_when_mixed_with_configurable():
 
     enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
 
-    # Native tools must reappear.
+    # Local policy keeps execute_code out of default/core toolsets.
+    # Users only get it via an explicit code_execution opt-in.
+    # hermes-cli should still restore the rest of the native CLI toolsets.
     for ts in ("terminal", "file", "web", "browser", "memory", "delegation",
-               "code_execution", "todo", "session_search", "skills"):
+               "todo", "session_search", "skills"):
         assert ts in enabled, f"{ts} should be enabled when hermes-cli is listed"
+    assert "code_execution" not in enabled
     # User explicitly opted into Spotify — must survive _DEFAULT_OFF_TOOLSETS subtraction.
     assert "spotify" in enabled
 
