@@ -338,6 +338,11 @@ DANGEROUS_PATTERNS = [
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
     # terminates all running agents mid-work.
+    (r'\bha\s+core\s+restart\b', "restart Home Assistant core"),
+    (r'\bha\s+supervisor\s+restart\b', "restart Home Assistant supervisor"),
+    (r'\bha\s+host\s+(reboot|shutdown)\b', "reboot/shutdown Home Assistant host"),
+    (r'\bhassio\s+host\s+(reboot|shutdown)\b', "reboot/shutdown Home Assistant host"),
+    (r'\bhassio\s+supervisor\s+restart\b', "restart Home Assistant supervisor"),
     (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Gateway protection: never start gateway outside systemd management

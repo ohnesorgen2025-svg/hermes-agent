@@ -90,6 +90,26 @@ class TestDetectDangerousSudo:
         assert key is not None
 
 
+class TestDetectHomeAssistantRestartCommands:
+    def test_ha_core_restart_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command("ha core restart")
+        assert is_dangerous is True
+        assert key is not None
+        assert "home assistant" in desc.lower()
+
+    def test_ha_host_reboot_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command("ha host reboot")
+        assert is_dangerous is True
+        assert key is not None
+        assert "home assistant" in desc.lower()
+
+    def test_hassio_supervisor_restart_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command("hassio supervisor restart")
+        assert is_dangerous is True
+        assert key is not None
+        assert "home assistant" in desc.lower()
+
+
 class TestDetectSqlPatterns:
     def test_drop_table(self):
         is_dangerous, _, desc = detect_dangerous_command("DROP TABLE users")
