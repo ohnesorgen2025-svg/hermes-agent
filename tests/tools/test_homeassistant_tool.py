@@ -270,6 +270,28 @@ class TestDomainBlocklist:
 class TestHomeAssistantApprovalGating:
     @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
     @patch("tools.homeassistant_tool._run_async")
+    def test_call_service_restart_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_call_service({"domain": "homeassistant", "service": "restart"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_call_service", "restart", "homeassistant.restart")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_call_service_stop_requires_approval(self, mock_run, mock_approval):
+        result = json.loads(_handle_call_service({"domain": "homeassistant", "service": "stop"}))
+
+        assert "error" in result
+        assert "approval required" in result["error"]
+        mock_approval.assert_called_once()
+        assert mock_approval.call_args.args[:3] == ("ha_call_service", "stop", "homeassistant.stop")
+        mock_run.assert_not_called()
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval", return_value="approval required")
+    @patch("tools.homeassistant_tool._run_async")
     def test_config_write_requires_approval(self, mock_run, mock_approval):
         result = json.loads(_handle_config_write({"path": "configuration.yaml", "content": "homeassistant:\n"}))
 
@@ -370,6 +392,26 @@ class TestHomeAssistantApprovalGating:
 
         mock_approval.assert_not_called()
         assert mock_run.call_count == 4
+
+    @patch("tools.homeassistant_tool._check_ha_tool_approval")
+    @patch("tools.homeassistant_tool._run_async")
+    def test_safe_call_service_does_not_request_approval(self, mock_run, mock_approval):
+        def fake_run_async(coro):
+            if hasattr(coro, "close"):
+                coro.close()
+            return {"success": True}
+
+        mock_run.side_effect = fake_run_async
+
+        result = json.loads(_handle_call_service({
+            "domain": "light",
+            "service": "turn_on",
+            "entity_id": "light.kitchen",
+        }))
+
+        assert "error" not in result
+        mock_approval.assert_not_called()
+        mock_run.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

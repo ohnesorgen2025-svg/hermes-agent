@@ -93,6 +93,7 @@ _HA_APPROVAL_SUPERVISOR_ACTIONS = frozenset({
     "uninstall", "restart", "stop",
     "uninstall_addon", "restart_addon", "stop_addon",
 })
+_HA_APPROVAL_HOMEASSISTANT_SERVICES = frozenset({"restart", "stop"})
 _HA_APPROVAL_INTEGRATION_ACTIONS = frozenset({"remove_entry", "remove", "delete"})
 _HA_APPROVAL_ZIGBEE_ACTIONS = frozenset({"remove_device", "remove"})
 
@@ -2266,6 +2267,16 @@ def _handle_call_service(args: dict, **kw) -> str:
             "error": f"Service domain '{domain}' is blocked for security. "
             f"Blocked domains: {', '.join(sorted(_BLOCKED_DOMAINS))}"
         })
+
+    if domain == "homeassistant" and service in _HA_APPROVAL_HOMEASSISTANT_SERVICES:
+        approval_error = _check_ha_tool_approval(
+            "ha_call_service",
+            service,
+            f"{domain}.{service}",
+            "This is a disruptive Home Assistant core service action.",
+        )
+        if approval_error:
+            return tool_error(approval_error)
 
     entity_id = args.get("entity_id")
     if entity_id and not _ENTITY_ID_RE.match(entity_id):
