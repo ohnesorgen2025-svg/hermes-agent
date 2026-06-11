@@ -150,6 +150,12 @@ def _xai_credentials_present() -> bool:
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
+    # Defense-in-depth: code_execution (execute_code) must never appear on
+    # constrained messaging/smart-home platforms.  Only allow it on trusted
+    # local/control-plane platforms where the user has direct shell access.
+    # Platform keys match PLATFORMS dict keys (cli, api_server) and the
+    # special "acp" key used by the ACP adapter.
+    "code_execution": {"cli", "acp", "api_server"},
 }
 
 
@@ -1531,6 +1537,18 @@ def _get_platform_tools(
     if disabled_toolsets:
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set
+
+    # Defense-in-depth: never expose code_execution on constrained platforms.
+    # This runs AFTER all other resolution logic (default toolsets, explicit
+    # overrides, plugin auto-enable, MCP recovery, disabled_toolsets) so that
+    # even a manual platform_toolsets override cannot bypass it.
+    _FORCED_OFF_TOOLSETS: Dict[str, Set[str]] = {
+        "homeassistant": {"code_execution"},
+        "telegram": {"code_execution"},
+    }
+    forced_off = _FORCED_OFF_TOOLSETS.get(platform, set())
+    if forced_off:
+        enabled_toolsets -= forced_off
 
     return enabled_toolsets
 

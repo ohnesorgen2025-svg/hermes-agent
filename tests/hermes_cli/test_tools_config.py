@@ -1294,6 +1294,96 @@ def test_save_platform_tools_strips_restricted_toolsets():
     assert "terminal" in saved
 
 
+# --- Defense-in-depth: code_execution platform restrictions ---
+
+def test_code_execution_platform_restrictions():
+    """code_execution toolset must only be allowed on cli, acp, api_server."""
+    from hermes_cli.tools_config import _toolset_allowed_for_platform
+    # Allowed platforms
+    assert _toolset_allowed_for_platform("code_execution", "cli")
+    assert _toolset_allowed_for_platform("code_execution", "acp")
+    assert _toolset_allowed_for_platform("code_execution", "api_server")
+    # Blocked platforms
+    for plat in ["homeassistant", "telegram", "discord", "slack", "whatsapp",
+                 "signal", "email", "matrix", "mattermost"]:
+        assert not _toolset_allowed_for_platform("code_execution", plat), (
+            f"code_execution should be blocked on {plat}"
+        )
+
+
+def test_code_execution_not_in_default_homeassistant_or_telegram():
+    """Default toolsets for homeassistant and telegram must not include
+    code_execution."""
+    for plat in ["homeassistant", "telegram"]:
+        enabled = _get_platform_tools({}, plat)
+        assert "code_execution" not in enabled, (
+            f"code_execution leaked into default {plat} toolset"
+        )
+
+
+def test_code_execution_blocked_by_manual_override():
+    """Even with an explicit platform_toolsets override, code_execution must
+    be stripped from homeassistant and telegram."""
+    for plat in ["homeassistant", "telegram"]:
+        config = {"platform_toolsets": {plat: ["code_execution"]}}
+        enabled = _get_platform_tools(config, plat)
+        assert "code_execution" not in enabled, (
+            f"code_execution leaked through manual override on {plat}"
+        )
+
+
+def test_code_execution_blocked_with_hass_token():
+    """code_execution must stay blocked on homeassistant even when HASS_TOKEN
+    is set (which auto-enables the homeassistant toolset)."""
+    import os
+    old = os.environ.get("HASS_TOKEN")
+    os.environ["HASS_TOKEN"] = "test_token"
+    try:
+        config = {"platform_toolsets": {"homeassistant": ["code_execution", "homeassistant"]}}
+        enabled = _get_platform_tools(config, "homeassistant")
+        assert "code_execution" not in enabled
+        assert "homeassistant" in enabled  # HA toolset itself should be present
+    finally:
+        if old is None:
+            os.environ.pop("HASS_TOKEN", None)
+        else:
+            os.environ["HASS_TOKEN"] = old
+
+
+def test_code_execution_allowed_on_cli_with_explicit_opt_in():
+    """code_execution must remain available on cli when explicitly enabled."""
+    config = {"platform_toolsets": {"cli": ["code_execution"]}}
+    enabled = _get_platform_tools(config, "cli")
+    assert "code_execution" in enabled
+
+
+def test_code_execution_allowed_on_api_server_with_explicit_opt_in():
+    """code_execution must remain available on api_server when explicitly enabled."""
+    config = {"platform_toolsets": {"api_server": ["code_execution"]}}
+    enabled = _get_platform_tools(config, "api_server")
+    assert "code_execution" in enabled
+
+
+def test_code_execution_mixed_override_strips_only_code_execution():
+    """When code_execution is mixed with legitimate toolsets on homeassistant,
+    only code_execution is stripped — the rest must survive."""
+    import os
+    old = os.environ.get("HASS_TOKEN")
+    os.environ["HASS_TOKEN"] = "test_token"
+    try:
+        config = {"platform_toolsets": {"homeassistant": ["code_execution", "web", "terminal", "homeassistant"]}}
+        enabled = _get_platform_tools(config, "homeassistant")
+        assert "code_execution" not in enabled
+        assert "homeassistant" in enabled
+        assert "web" in enabled
+        assert "terminal" in enabled
+    finally:
+        if old is None:
+            os.environ.pop("HASS_TOKEN", None)
+        else:
+            os.environ["HASS_TOKEN"] = old
+
+
 def test_get_platform_tools_feishu_includes_doc_and_drive():
     enabled = _get_platform_tools({}, "feishu")
     assert "feishu_doc" in enabled
