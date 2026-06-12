@@ -50,6 +50,46 @@ MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 
 
+def _get_sync_categories() -> Tuple[bool, set]:
+    """Return (filter_active, allowed_categories) for skill sync.
+
+    When ``HERMES_SYNC_CATEGORIES`` is set (comma-separated category names),
+    only skills and DESCRIPTION.md files under those categories are synced.
+    When empty or unset, all categories are synced (backward-compatible).
+
+    The config key ``skills.sync_categories`` in config.yaml is also checked,
+    but the environment variable takes precedence.
+
+    Returns:
+        filter_active: True when a non-empty allowlist is in effect.
+        allowed_categories: Set of category directory names to allow.
+    """
+    # Environment variable takes precedence.
+    env_val = os.environ.get("HERMES_SYNC_CATEGORIES", "").strip()
+    if env_val:
+        categories = {c.strip() for c in env_val.split(",") if c.strip()}
+        return (True, categories)
+
+    # Fall back to config.yaml (skills.sync_categories).
+    try:
+        import yaml
+        config_path = HERMES_HOME / "config.yaml"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            skills_cfg = cfg.get("skills") or {}
+            if isinstance(skills_cfg, dict):
+                cats = skills_cfg.get("sync_categories")
+                if isinstance(cats, list) and cats:
+                    categories = {str(c).strip() for c in cats if str(c).strip()}
+                    return (True, categories)
+    except Exception:
+        logger.debug("Failed to read skills.sync_categories from config", exc_info=True)
+
+    # No filter — sync all categories (backward-compatible default).
+    return (False, set())
+
+
 def _get_bundled_dir() -> Path:
     """Locate the bundled skills/ directory.
 
@@ -176,7 +216,14 @@ def _discover_bundled_skills(bundled_dir: Path) -> List[Tuple[str, Path]]:
     """
     Find all SKILL.md files in the bundled directory.
     Returns list of (skill_name, skill_directory_path) tuples.
+
+    When a sync-categories allowlist is active (via HERMES_SYNC_CATEGORIES
+    or skills.sync_categories in config.yaml), only skills under the listed
+    category directories are returned. Top-level skills (no category parent)
+    are always included since they are not inside a category subdirectory.
     """
+    filter_active, allowed_categories = _get_sync_categories()
+
     skills = []
     if not bundled_dir.exists():
         return skills
@@ -185,6 +232,16 @@ def _discover_bundled_skills(bundled_dir: Path) -> List[Tuple[str, Path]]:
         if is_excluded_skill_path(skill_md):
             continue
         skill_dir = skill_md.parent
+
+        # Apply category allowlist: the category is the first path component
+        # relative to bundled_dir (e.g. "smart-home" in smart-home/openhue).
+        if filter_active:
+            rel = skill_dir.relative_to(bundled_dir)
+            category = rel.parts[0] if len(rel.parts) > 1 else None
+            # Top-level skills (no category parent) are always included.
+            if category is not None and category not in allowed_categories:
+                continue
+
         skill_name = _read_skill_name(skill_md, skill_dir.name)
         skills.append((skill_name, skill_dir))
 
@@ -487,6 +544,11 @@ def sync_skills(quiet: bool = False) -> dict:
     bundled_names = {name for name, _ in bundled_skills}
     suppressed = _read_suppressed_names()
 
+    filter_active, allowed_categories = _get_sync_categories()
+    if filter_active and not quiet:
+        cats = ", ".join(sorted(allowed_categories))
+        print(f"  (sync categories filter active: {cats})")
+
     copied = []
     updated = []
     user_modified = []
@@ -601,9 +663,17 @@ def sync_skills(quiet: bool = False) -> dict:
     for name in cleaned:
         del manifest[name]
 
-    # Also copy DESCRIPTION.md files for categories (if not already present)
+    # Also copy DESCRIPTION.md files for categories (if not already present).
+    # When a sync-categories allowlist is active, only copy DESCRIPTION.md
+    # files under allowed categories — prevents re-creating category dirs
+    # for non-HA skills that the user deleted.
+    filter_active, allowed_categories = _get_sync_categories()
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
+        if filter_active:
+            category = rel.parts[0] if len(rel.parts) > 1 else None
+            if category is not None and category not in allowed_categories:
+                continue
         dest_desc = SKILLS_DIR / rel
         if not dest_desc.exists():
             try:
@@ -615,7 +685,7 @@ def sync_skills(quiet: bool = False) -> dict:
     _write_manifest(manifest)
     optional_provenance_backfilled = _backfill_optional_provenance(quiet=quiet)
 
-    return {
+    result = {
         "copied": copied,
         "updated": updated,
         "skipped": skipped,
@@ -625,6 +695,9 @@ def sync_skills(quiet: bool = False) -> dict:
         "total_bundled": len(bundled_skills),
         "optional_provenance_backfilled": optional_provenance_backfilled,
     }
+    if filter_active:
+        result["sync_categories"] = sorted(allowed_categories)
+    return result
 
 
 def _rmtree_writable(path: Path) -> None:

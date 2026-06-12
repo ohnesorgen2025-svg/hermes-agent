@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from tools.skills_sync import (
     _get_bundled_dir,
+    _get_sync_categories,
     _read_manifest,
     _read_skill_name,
     _write_manifest,
@@ -1067,3 +1068,237 @@ class TestOptOutToggleAndRemove:
             assert "EDITED" in (skills_dir / "beta" / "SKILL.md").read_text()
             # non-bundled local skill never considered
             assert (skills_dir / "mine" / "SKILL.md").exists()
+
+
+class TestGetSyncCategories:
+    """Tests for _get_sync_categories() — the allowlist mechanism."""
+
+    def test_no_filter_when_env_unset(self, tmp_path, monkeypatch):
+        """When HERMES_SYNC_CATEGORIES is unset and no config, all categories pass."""
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES", raising=False)
+        monkeypatch.setattr("tools.skills_sync.HERMES_HOME", tmp_path)
+        # No config.yaml
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is False
+        assert allowed == set()
+
+    def test_env_var_sets_categories(self, monkeypatch):
+        """HERMES_SYNC_CATEGORIES env var sets the allowlist."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home,devops")
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is True
+        assert allowed == {"smart-home", "devops"}
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_env_var_empty_means_all(self, monkeypatch):
+        """Empty HERMES_SYNC_CATEGORIES means no filter (all categories)."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "")
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is False
+        assert allowed == set()
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_env_var_takes_precedence_over_config(self, tmp_path, monkeypatch):
+        """Env var overrides config.yaml."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        config = tmp_path / "config.yaml"
+        config.write_text("skills:\n  sync_categories:\n    - github\n    - mlops\n")
+        monkeypatch.setattr("tools.skills_sync.HERMES_HOME", tmp_path)
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is True
+        assert allowed == {"smart-home"}
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_config_yaml_sets_categories(self, tmp_path, monkeypatch):
+        """skills.sync_categories in config.yaml sets the allowlist."""
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES", raising=False)
+        config = tmp_path / "config.yaml"
+        config.write_text("skills:\n  sync_categories:\n    - smart-home\n    - devops\n")
+        monkeypatch.setattr("tools.skills_sync.HERMES_HOME", tmp_path)
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is True
+        assert allowed == {"smart-home", "devops"}
+
+    def test_config_yaml_empty_list_means_all(self, tmp_path, monkeypatch):
+        """Empty skills.sync_categories list means no filter."""
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES", raising=False)
+        config = tmp_path / "config.yaml"
+        config.write_text("skills:\n  sync_categories: []\n")
+        monkeypatch.setattr("tools.skills_sync.HERMES_HOME", tmp_path)
+        filter_active, allowed = _get_sync_categories()
+        assert filter_active is False
+        assert allowed == set()
+
+
+class TestSyncCategoriesFilter:
+    """Tests for the sync-categories allowlist filtering skill sync."""
+
+    def _setup_multi_category_bundled(self, tmp_path):
+        """Create a fake bundled skills dir with multiple categories."""
+        bundled = tmp_path / "bundled_skills"
+        # smart-home category
+        (bundled / "smart-home" / "openhue").mkdir(parents=True)
+        (bundled / "smart-home" / "openhue" / "SKILL.md").write_text("---\nname: openhue\n---\nOpenHue skill")
+        (bundled / "smart-home" / "DESCRIPTION.md").write_text("# Smart Home")
+        # apple category
+        (bundled / "apple" / "imessage").mkdir(parents=True)
+        (bundled / "apple" / "imessage" / "SKILL.md").write_text("---\nname: imessage\n---\niMessage skill")
+        (bundled / "apple" / "DESCRIPTION.md").write_text("# Apple")
+        # creative category
+        (bundled / "creative" / "sketch").mkdir(parents=True)
+        (bundled / "creative" / "sketch" / "SKILL.md").write_text("---\nname: sketch\n---\nSketch skill")
+        (bundled / "creative" / "DESCRIPTION.md").write_text("# Creative")
+        # top-level skill (no category)
+        (bundled / "yuanbao").mkdir()
+        (bundled / "yuanbao" / "SKILL.md").write_text("---\nname: yuanbao\n---\nYuanbao skill")
+        return bundled
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
+    def test_allowlist_only_syncs_allowed_categories(self, tmp_path, monkeypatch):
+        """With HERMES_SYNC_CATEGORIES=smart-home, only smart-home skills
+        and DESCRIPTION.md are synced — apple/creative are excluded."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        # Only openhue (smart-home) was copied
+        assert "openhue" in result["copied"]
+        assert "imessage" not in result["copied"]
+        assert "sketch" not in result["copied"]
+        # Top-level skill (yuanbao) is always included
+        assert "yuanbao" in result["copied"]
+        # Only smart-home DESCRIPTION.md was copied
+        assert (skills_dir / "smart-home" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "apple" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "creative" / "DESCRIPTION.md").exists()
+        # Result includes sync_categories
+        assert result.get("sync_categories") == ["smart-home"]
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_allowlist_multiple_categories(self, tmp_path, monkeypatch):
+        """With multiple categories, all allowed categories are synced."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home,apple")
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert "openhue" in result["copied"]
+        assert "imessage" in result["copied"]
+        assert "sketch" not in result["copied"]
+        assert "yuanbao" in result["copied"]
+        assert (skills_dir / "smart-home" / "DESCRIPTION.md").exists()
+        assert (skills_dir / "apple" / "DESCRIPTION.md").exists()
+        assert not (skills_dir / "creative" / "DESCRIPTION.md").exists()
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_no_filter_syncs_all_categories(self, tmp_path, monkeypatch):
+        """Without HERMES_SYNC_CATEGORIES, all categories are synced (backward compat)."""
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES", raising=False)
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert len(result["copied"]) == 4
+        assert "openhue" in result["copied"]
+        assert "imessage" in result["copied"]
+        assert "sketch" in result["copied"]
+        assert "yuanbao" in result["copied"]
+        assert (skills_dir / "smart-home" / "DESCRIPTION.md").exists()
+        assert (skills_dir / "apple" / "DESCRIPTION.md").exists()
+        assert (skills_dir / "creative" / "DESCRIPTION.md").exists()
+        # No sync_categories key when filter is inactive
+        assert "sync_categories" not in result
+
+    def test_local_non_bundle_skills_unaffected_by_allowlist(self, tmp_path, monkeypatch):
+        """Local skills not in the bundle (e.g. hermes-und-ich) are never
+        touched by sync_skills, regardless of the allowlist."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # Pre-create a local skill that is NOT in the bundle
+        local_skill = skills_dir / "hermes-und-ich" / "my-skill"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text("---\nname: my-skill\n---\nLocal skill")
+        local_content = (local_skill / "SKILL.md").read_text()
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        # Local skill is untouched
+        assert (skills_dir / "hermes-und-ich" / "my-skill" / "SKILL.md").exists()
+        assert (skills_dir / "hermes-und-ich" / "my-skill" / "SKILL.md").read_text() == local_content
+        # Local skill is not in any result list
+        assert "my-skill" not in result["copied"]
+        assert "my-skill" not in result["updated"]
+        assert "my-skill" not in result["user_modified"]
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_allowlist_does_not_delete_existing_non_allowed_skills(self, tmp_path, monkeypatch):
+        """If a non-allowed skill already exists on disk from a previous sync
+        (before the allowlist was set), it is NOT deleted — only skipped."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # First sync without filter — copies everything
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES", raising=False)
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+
+        # Verify apple/imessage exists
+        assert (skills_dir / "apple" / "imessage" / "SKILL.md").exists()
+
+        # Now enable filter and re-sync
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        # apple/imessage still exists on disk — not deleted
+        assert (skills_dir / "apple" / "imessage" / "SKILL.md").exists()
+        # But it's not in copied/updated — just skipped
+        assert "imessage" not in result["copied"]
+        assert "imessage" not in result["updated"]
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
+
+    def test_description_md_not_copied_for_filtered_categories(self, tmp_path, monkeypatch):
+        """DESCRIPTION.md files for filtered-out categories must NOT be copied,
+        even when the category directory already exists from a prior sync."""
+        monkeypatch.setenv("HERMES_SYNC_CATEGORIES", "smart-home")
+        bundled = self._setup_multi_category_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # Pre-create the apple category dir (simulating a prior full sync)
+        (skills_dir / "apple").mkdir(parents=True)
+        # Delete the DESCRIPTION.md to test that it's NOT re-created
+        # (it doesn't exist yet, so this is the default state)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        # apple/DESCRIPTION.md must NOT exist — filter prevents it
+        assert not (skills_dir / "apple" / "DESCRIPTION.md").exists()
+        # smart-home/DESCRIPTION.md must exist
+        assert (skills_dir / "smart-home" / "DESCRIPTION.md").exists()
+        monkeypatch.delenv("HERMES_SYNC_CATEGORIES")
